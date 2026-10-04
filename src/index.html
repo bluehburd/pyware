@@ -16,7 +16,7 @@ body{display:flex;flex-direction:column;overflow:hidden}
 .tn[contenteditable=true]{text-overflow:clip;background:var(--bar);padding:0 3px;border-radius:3px;cursor:text}
 .tx{border:0;background:transparent;border-radius:4px;width:22px;height:22px;cursor:pointer;font-size:11px;opacity:.6}
 .tx:hover{background:rgba(128,128,128,.3);opacity:1}
-#tPlus{margin-bottom:3px;font-size:16px;padding:2px 10px}
+#tPlus{align-self:center;margin:0;padding:0;width:28px;height:28px;font-size:16px}
 #bar .t{font-weight:600;margin-right:10px}
 #bar .sp{flex:1}
 button,select,input{font:inherit;color:var(--fg)}
@@ -33,7 +33,7 @@ button,select,input{font:inherit;color:var(--fg)}
 .nh{height:22px;flex:none;cursor:move;font-size:11px;opacity:.5;padding:4px 10px;user-select:none}
 .nb{flex:1;min-height:0;overflow:auto;outline:0;padding:2px 12px 10px;font-size:var(--fs);font-family:var(--ff);color:#1a1a1a;white-space:pre-wrap;word-break:break-word;cursor:text}
 .nb:empty:before{content:'Type here…';opacity:.45}
-#cm{position:fixed;display:none;z-index:100000;flex-direction:column;gap:2px;min-width:200px;background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:6px;box-shadow:0 6px 24px rgba(0,0,0,.35)}
+#cm{position:fixed;display:none;z-index:100000;flex-direction:column;gap:2px;min-width:200px;background:var(--bg);border:1px solid var(--bd);border-radius:0;padding:6px;box-shadow:0 6px 24px rgba(0,0,0,.35)}
 #cm .r{display:flex;align-items:center;gap:5px;padding:3px}
 #cm .b{min-width:32px;text-align:center}
 .sw{width:20px;height:20px;border-radius:50%;border:1px solid rgba(128,128,128,.6);cursor:pointer;padding:0}
@@ -41,7 +41,11 @@ button,select,input{font:inherit;color:var(--fg)}
 .pin{border-radius:50%;background:radial-gradient(circle at 35% 30%,#ff9a8f 0,#d32f2f 45%,#8e1b1b 100%);box-shadow:2px 4px 6px rgba(0,0,0,.45);cursor:move}
 .pin .rz{display:none!important}
 #vp.pinmode,#vp.pinmode .item{cursor:crosshair}
-#pm{position:fixed;display:none;z-index:100000;background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:6px;box-shadow:0 6px 24px rgba(0,0,0,.35)}
+#pm{position:fixed;display:none;z-index:100000;background:var(--bg);border:1px solid var(--bd);border-radius:0;padding:6px;box-shadow:0 6px 24px rgba(0,0,0,.35)}
+.b{display:inline-flex;align-items:center;justify-content:center}
+.ic{width:16px;height:16px;fill:currentColor;margin-right:7px;flex:none}
+.t .ic{width:18px;height:18px;margin-right:8px;vertical-align:-4px}
+.tx .ic,#tPlus .ic{width:12px;height:12px;margin:0}
 .sw.cur{outline:2px solid var(--acc);outline-offset:2px}
 .dot{display:inline-block;width:11px;height:11px;border-radius:50%;vertical-align:middle;border:1px solid rgba(128,128,128,.6)}
 #sF{color:var(--acc);font-weight:600}
@@ -52,27 +56,36 @@ button,select,input{font:inherit;color:var(--fg)}
 #hint{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;text-align:center;opacity:.45;pointer-events:none;line-height:1.8}
 #st{padding:3px 12px;font-size:12px;background:var(--bar);border-top:1px solid var(--bd);display:flex;gap:18px}
 #modal{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;z-index:99999}
-#modal .box{background:var(--bg);border:1px solid var(--bd);border-radius:10px;padding:20px 24px;width:360px;box-shadow:0 10px 40px rgba(0,0,0,.4)}
+#modal .box{background:var(--bg);border:1px solid var(--bd);border-radius:0;padding:20px 24px;width:360px;box-shadow:0 10px 40px rgba(0,0,0,.4)}
 #modal h3{margin:0 0 14px}
 .row{display:flex;justify-content:space-between;align-items:center;margin:10px 0}
-select,input[type=number]{background:var(--bar);border:1px solid var(--bd);border-radius:6px;padding:4px 8px}
+select,input[type=number]{background:var(--bar);border:1px solid var(--bd);border-radius:0;padding:4px 8px}
+#cm .b,#modal .b,#pm .b{border-radius:0}
+button:focus,button:focus-visible,.tab:focus,.tab:focus-visible,.tn:focus,.tn:focus-visible{outline:none}
+#cm,#cm *,#pm,#pm *,#modal .box,#modal .box *{outline:none!important}
+#cm,#pm,#modal .box,#modal select,#modal input[type=number],#modal .b{border:0}
+[data-theme=dark] #cm,[data-theme=dark] #pm,[data-theme=dark] #modal .box{background:#292929;color:#fff}
+[data-theme=dark] #cm button,[data-theme=dark] #pm button,[data-theme=dark] #modal .box button,[data-theme=dark] #modal .box select,[data-theme=dark] #modal .box input{color:#fff}
+[data-theme=dark] #modal .box select,[data-theme=dark] #modal .box input[type=number]{background:#3e3e3e}
+[data-theme=dark] #cm .b:hover,[data-theme=dark] #pm .b:hover,[data-theme=dark] #modal .b:not(.on):hover{background:#3e3e3e}
+#cm .sw.cur{outline:2px solid var(--acc)!important;outline-offset:2px}
 </style></head>
 <body>
 <div id="tabs"></div>
 <div id="bar">
-  <span class="t">📝 Board Pad</span>
-  <button class="b" id="bNote" title="Add note (or double-click the board)">＋ Note</button>
-  <button class="b" id="bPin" title="Pin mode: click the board to drop a pin. Ctrl+click two pins, then right-click to tie a red string (Esc to leave pin mode)">📌 Pin</button>
-  <button class="b" id="bHand" title="Drag to move the board (or hold Space / middle mouse)">✋ Move board</button>
-  <button class="b" id="bUndo" style="display:none" title="Reopen the tab you just closed">↩ Reopen tab</button>
-  <button class="b" id="bFit" title="Reset view">⤢ Reset view</button>
+  <span class="t"></span>
+  <button class="b" id="bNote" title="Add note (or double-click the board)">Note</button>
+  <button class="b" id="bPin" title="Pin mode: click the board to drop a pin. Ctrl+click two pins, then right-click to tie a red string (Esc to leave pin mode)">Pin</button>
+  <button class="b" id="bHand" title="Drag to move the board (or hold Space / middle mouse)">Move board</button>
+  <button class="b" id="bUndo" style="display:none" title="Reopen the tab you just closed">Reopen tab</button>
+  <button class="b" id="bFit" title="Reset view">Reset view</button>
   <span class="sp"></span>
   <button class="b" id="bOpen" title="Open board (Ctrl+O)">Open</button>
   <button class="b" id="bSave" title="Save board to file (Ctrl+S)">Save</button>
-  <button class="b" id="bSet" title="Settings">⚙ Settings</button>
+  <button class="b" id="bSet" title="Settings">Settings</button>
 </div>
 <div id="vp"><div id="world"></div><div id="mq"></div>
-  <div id="hint">Just start typing to add a note<br>Paste or drop images anywhere<br>Ctrl + click or drag a box to select several<br>Space + drag (or ✋) moves the board</div></div>
+  <div id="hint">Just start typing to add a note<br>Paste or drop images anywhere<br>Ctrl + click or drag a box to select several<br>Space + drag (or the Move board button) moves the board</div></div>
 <div id="st"><span id="sI"></span><span id="sS"></span><span id="sZ"></span><span id="sM"></span><span id="sF" style="margin-left:auto"></span></div>
 
 <div id="modal"><div class="box">
@@ -94,11 +107,28 @@ select,input[type=number]{background:var(--bar);border:1px solid var(--bd);borde
 
 <script>
 const $=s=>document.querySelector(s),vp=$('#vp'),world=$('#world'),mq=$('#mq');
+const IC={
+ app:'M4 3h16v18H4zM7 8v2h10V8zM7 12v2h10v-2zM7 16v2h6v-2z',
+ note:'M11 4h2v7h7v2h-7v7h-2v-7H4v-2h7z',
+ pin:'M8 2h8v2h-1v5.2l3 2.8v2h-5.2v6.2l-.8.8-.8-.8V14H6v-2l3-2.8V4H8z',
+ move:'M12 2l4 4h-3v5h5V8l4 4-4 4v-3h-5v5h3l-4 4-4-4h3v-5H6v3l-4-4 4-4v3h5V6H8z',
+ fit:'M3 3h7v2H5v5H3zM14 3h7v7h-2V5h-5zM3 14h2v5h5v2H3zM19 14h2v5h-5v2h7v-7z',
+ undo:'M12 5V1L6 6l6 5V7c3.3 0 6 2.7 6 6s-2.7 6-6 6-6-2.7-6-6H4c0 4.4 3.6 8 8 8s8-3.6 8-8-3.6-8-8-8z',
+ open:'M3 5a2 2 0 0 1 2-2h4.2l2 2.5H19a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z',
+ save:'M5 3h11.5L21 7.5V19a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2zM7 4v4h7V4zM7 14v6h10v-6z',
+ gear:'M10.34 4.79L10.58 1.90L13.42 1.90L13.66 4.79L15.92 5.72L18.14 3.85L20.15 5.86L18.28 8.08L19.21 10.34L22.10 10.58L22.10 13.42L19.21 13.66L18.28 15.92L20.15 18.14L18.14 20.15L15.92 18.28L13.66 19.21L13.42 22.10L10.58 22.10L10.34 19.21L8.08 18.28L5.86 20.15L3.85 18.14L5.72 15.92L4.79 13.66L1.90 13.42L1.90 10.58L4.79 10.34L5.72 8.08L3.85 5.86L5.86 3.85L8.08 5.72zM12 8.6a3.4 3.4 0 1 0 0 6.8a3.4 3.4 0 1 0 0-6.8z',
+ x:'M5.6 4.2L12 10.6l6.4-6.4 1.4 1.4-6.4 6.4 6.4 6.4-1.4 1.4-6.4-6.4-6.4 6.4-1.4-1.4 6.4-6.4-6.4-6.4z',
+ plus:'M11 4h2v7h7v2h-7v7h-2v-7H4v-2h7z',
+ tie:'M6.5 17.6L18.5 7.6 17.5 6.4 5.5 16.4zM6 14a3 3 0 1 0 0 6a3 3 0 1 0 0-6zM18 4a3 3 0 1 0 0 6a3 3 0 1 0 0-6z',
+ cut:'M6.5 17.6L11.3 13.6 10.3 12.4 5.5 16.4zM13.7 11.6L18.5 7.6 17.5 6.4 12.7 10.4zM6 14a3 3 0 1 0 0 6a3 3 0 1 0 0-6zM18 4a3 3 0 1 0 0 6a3 3 0 1 0 0-6z'};
+const ic=n=>`<svg class="ic" viewBox="0 0 24 24" aria-hidden="true"><path fill-rule="evenodd" d="${IC[n]}"/></svg>`;
+[['bNote','note'],['bPin','pin'],['bHand','move'],['bUndo','undo'],['bFit','fit'],['bOpen','open'],['bSave','save'],['bSet','gear']].forEach(([id,n])=>$('#'+id).insertAdjacentHTML('afterbegin',ic(n)));
+$('#bar .t').insertAdjacentHTML('afterbegin',ic('app'));
 let S={tabs:[],cur:null,n:0,items:[],strings:[],view:{x:80,y:80,z:1},cfg:{theme:'system',bg:'dots',ff:'Segoe UI',fs:16,snap:false,auto:true}};
 let closed=[],sel=new Set(),dom={},drag=null,tool='select',space=false,zTop=1,mouse={x:300,y:200},tmr;
 const KEY='boardpad.v1',get=id=>S.items.find(i=>i.id===id),snap=v=>S.cfg.snap?Math.round(v/24)*24:v;
 
-function flush(){if(!S.cfg.auto)return;try{localStorage.setItem(KEY,JSON.stringify(snapshot()));$('#sM').textContent=''}catch(e){$('#sM').textContent='⚠ Storage full – use Save to keep your boards'}}
+function flush(){if(!S.cfg.auto)return;try{localStorage.setItem(KEY,JSON.stringify(snapshot()));$('#sM').textContent=''}catch(e){$('#sM').textContent='Storage full – use Save to keep your boards'}}
 function save(){clearTimeout(tmr);tmr=setTimeout(flush,400);stat()}
 addEventListener('pagehide',flush);document.addEventListener('visibilitychange',()=>{if(document.hidden)flush()});
 function stat(){$('#sI').textContent=S.items.length+' items';$('#sS').textContent=sel.size?sel.size+' selected':'';$('#sZ').textContent=Math.round(S.view.z*100)+'%';$('#hint').style.display=S.items.length?'none':'flex'}
@@ -203,7 +233,7 @@ function drawStrings(){svg.innerHTML='';S.strings=S.strings.filter(s=>get(s.a)&&
 const pm=$('#pm'),hidePm=()=>pm.style.display='none';let pair=null;
 const linked=(a,b)=>S.strings.findIndex(s=>(s.a===a&&s.b===b)||(s.a===b&&s.b===a));
 function pinMenu(e){hidePm();const l=[...sel].map(get);if(l.length!==2||l.some(i=>!i||i.type!=='pin'))return;e.preventDefault();pair=l.map(i=>i.id);
- $('#pTie').textContent=linked(pair[0],pair[1])>=0?'✂ Cut red string':'🧵 Tie red string';
+ $('#pTie').innerHTML=linked(pair[0],pair[1])>=0?ic('cut')+'Cut red string':ic('tie')+'Tie red string';
  pm.style.display='block';pm.style.left=Math.max(4,Math.min(e.clientX,innerWidth-pm.offsetWidth-8))+'px';pm.style.top=Math.max(4,Math.min(e.clientY,innerHeight-pm.offsetHeight-8))+'px'}
 $('#pTie').onclick=()=>{const i=linked(pair[0],pair[1]);if(i>=0)S.strings.splice(i,1);else S.strings.push({a:pair[0],b:pair[1]});hidePm();setSel([]);save()};
 
@@ -221,14 +251,14 @@ function closeTab(id){sync();const i=S.tabs.findIndex(t=>t.id===id);if(i<0)retur
 function renderTabs(){const b=$('#tabs');b.innerHTML='';
  S.tabs.forEach(t=>{const d=document.createElement('div');d.className='tab'+(t.id===S.cur?' on':'');
   const n=document.createElement('span');n.className='tn';n.textContent=t.name;
-  const x=document.createElement('button');x.className='tx';x.textContent='✕';x.title='Close tab';x.onclick=e=>{e.stopPropagation();closeTab(t.id)};
+  const x=document.createElement('button');x.className='tx';x.innerHTML=ic('x');x.title='Close tab';x.onclick=e=>{e.stopPropagation();closeTab(t.id)};
   d.append(n,x);d.onclick=()=>{if(t.id!==S.cur)show(t.id)};
   d.onauxclick=e=>{if(e.button===1){e.preventDefault();closeTab(t.id)}};
   n.ondblclick=e=>{e.stopPropagation();n.contentEditable='true';n.focus();getSelection().selectAllChildren(n)};
   n.onblur=()=>{n.contentEditable='false';t.name=n.textContent.trim()||t.name;n.textContent=t.name;save()};
   n.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();n.blur()}e.stopPropagation()};
   b.append(d)});
- const p=document.createElement('button');p.className='b';p.id='tPlus';p.textContent='＋';p.title='New tab';p.onclick=addTab;b.append(p);
+ const p=document.createElement('button');p.className='b';p.id='tPlus';p.innerHTML=ic('plus');p.title='New tab';p.onclick=addTab;b.append(p);
  $('#bUndo').style.display=closed.length?'':'none'}
 $('#bUndo').onclick=()=>{const t=closed.pop();if(t){S.tabs.push(t);show(t.id)}};
 
