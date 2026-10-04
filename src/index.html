@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en"><head><meta charset="utf-8"><title>Board Pad</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#f3f3f3">
 <style>
 :root{--bg:#fbfbfb;--bar:#f3f3f3;--fg:#1a1a1a;--bd:#d6d6d6;--acc:#0067c0;--note:#feff9c;--dot:#c4c4c4;--fs:16px;--ff:'Segoe UI',sans-serif}
 [data-theme=dark]{--bg:#1e1e1e;--bar:#2b2b2b;--fg:#f0f0f0;--bd:#444;--acc:#4cc2ff;--note:#feff9c;--dot:#454545}
@@ -137,6 +138,7 @@ function apply(){const v=S.view;world.style.transform=`translate(${v.x}px,${v.y}
  vp.style.backgroundImage=S.cfg.bg==='dots'?`radial-gradient(${c} 1.2px,transparent 1.5px)`:S.cfg.bg==='grid'?`linear-gradient(${c} 1px,transparent 1px),linear-gradient(90deg,${c} 1px,transparent 1px)`:'none';stat()}
 function cfg(){const c=S.cfg,r=document.documentElement;
  r.dataset.theme=c.theme==='system'?(matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light'):c.theme;
+ document.querySelector('meta[name=theme-color]').content=getComputedStyle(r).getPropertyValue('--bar').trim();
  r.style.setProperty('--fs',c.fs+'px');r.style.setProperty('--ff',`'${c.ff}',sans-serif`);apply()}
 
 function mk(it){const d=document.createElement('div');d.className='item '+it.type;d.dataset.id=it.id;
