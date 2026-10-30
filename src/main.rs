@@ -315,12 +315,12 @@ fn build_job(text: &str, runs: &[Run], size: f32, wrap: f32, bold: &FontFamily) 
             color: c,
             italics: st.i,
             underline: if st.u {
-                Stroke::new(1.0, c)
+                Stroke::new(1.0_f32, c)
             } else {
                 Stroke::NONE
             },
             strikethrough: if st.s {
-                Stroke::new(1.0, c)
+                Stroke::new(1.0_f32, c)
             } else {
                 Stroke::NONE
             },
@@ -644,8 +644,8 @@ fn note_ui(
                         .show(ui);
                     if te.response.has_focus() {
                         if let Some(cr) = te.cursor_range {
-                            let a = cr.primary.index;
-                            let b = cr.secondary.index;
+                            let a = cr.primary.ccursor.index;
+                            let b = cr.secondary.ccursor.index;
                             note.sel = (a.min(b), a.max(b));
                         }
                         for (k, which) in [(Key::B, 0u8), (Key::I, 1), (Key::U, 2)] {
@@ -658,9 +658,11 @@ fn note_ui(
                     if te.response.clicked() || te.response.gained_focus() {
                         out.clicked = true;
                     }
-                    if te.response.context_menu(|ui| format_menu(ui, note)) == Some(true) {
-                        fmt_changed = true;
-                    }
+                    te.response.context_menu(|ui| {
+                        if format_menu(ui, note) {
+                            fmt_changed = true;
+                        }
+                    });
                 });
         });
         if fmt_changed {
@@ -747,7 +749,7 @@ fn img_ui(
             Color32::WHITE,
         ),
         None => p.rect_filled(r, 0.0, Color32::from_gray(225)),
-    }
+    };
     if live {
         let resp = ui.interact(r, Id::new(("im", im.id)), Sense::click_and_drag());
         if resp.dragged() {
@@ -1308,7 +1310,7 @@ impl App {
             dirty = true;
         }
         if !incoming.is_empty() {
-            let at = to_world(hover.unwrap_or(rect.center())).to_vec2();
+            let at = to_world(hover.unwrap_or(rect.center()));
             sel.clear();
             for (k, img) in incoming.into_iter().enumerate() {
                 let off = vec2(24.0, 24.0) * k as f32;
@@ -1487,7 +1489,7 @@ impl App {
                         mr.right_bottom(),
                         mr.left_bottom(),
                     ],
-                    Stroke::new(1.0, ACC),
+                    Stroke::new(1.0_f32, ACC),
                 ));
             } else {
                 self.marquee = None;
