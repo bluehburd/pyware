@@ -7,7 +7,11 @@ use eframe::egui::{
     Rect, Sense, Stroke, Vec2,
 };
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+};
 
 const NOTE: Color32 = Color32::from_rgb(0xfe, 0xff, 0x9c);
 const INK: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
@@ -60,11 +64,35 @@ struct Note {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
+struct Img {
+    id: u64,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
+// a pin is free (x,y = world position) or attached to a note/image (x,y = offset from its top-left)
+#[derive(Clone, Serialize, Deserialize)]
+struct Pin {
+    id: u64,
+    x: f32,
+    y: f32,
+    at: Option<u64>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
 struct Tab {
     name: String,
     notes: Vec<Note>,
     pan: [f32; 2],
     zoom: f32,
+    #[serde(default)]
+    images: Vec<Img>,
+    #[serde(default)]
+    pins: Vec<Pin>,
+    #[serde(default)]
+    strings: Vec<(u64, u64)>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -377,10 +405,161 @@ struct View {
     z: f32,
 }
 
-struct NoteOut {
+#[derive(Clone, Copy, PartialEq)]
+enum Tool {
+    Select,
+    Pin,
+    Hand,
+}
+
+// what one item reports back; the board applies moves/selection for the whole group
+#[derive(Default)]
+struct ItemOut {
     delete: bool,
-    front: bool,
+    clicked: bool,
+    started: bool,
+    stopped: bool,
     changed: bool,
+    tie: bool,
+    cut: bool,
+    drag: Vec2,
+}
+
+// lazy texture cache: images live as PNG files in %APPDATA%/BoardPad/img
+struct Tex {
+    map: HashMap<u64, egui::TextureHandle>,
+    bad: HashSet<u64>,
+    dir: PathBuf,
+    loaded: bool,
+}
+
+impl Tex {
+    // loads at most one texture per frame so big boards never stall
+    fn get(&mut self, ctx: &egui::Context, id: u64) -> Option<egui::TextureId> {
+        if let Some(t) = self.map.get(&id) {
+            return Some(t.id());
+        }
+        if self.bad.contains(&id) {
+            return None;
+        }
+        if self.loaded {
+            ctx.request_repaint();
+            return None;
+        }
+        self.loaded = true;
+        match image::open(self.dir.join(format!("{}.png", id))) {
+            Ok(img) => {
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let ci = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                let h = ctx.load_texture(format!("i{}", id), ci, egui::TextureOptions::LINEAR);
+                let tid = h.id();
+                self.map.insert(id, h);
+                ctx.request_repaint();
+                Some(tid)
+            }
+            Err(_) => {
+                self.bad.insert(id);
+                None
+            }
+        }
+    }
+}
+
+fn host_rects(t: &Tab) -> HashMap<u64, Rect> {
+    t.images
+        .iter()
+        .map(|m| (m.id, Rect::from_min_size(pos2(m.x, m.y), vec2(m.w, m.h))))
+        .chain(
+            t.notes
+                .iter()
+                .map(|n| (n.id, Rect::from_min_size(pos2(n.x, n.y), vec2(n.w, n.h)))),
+        )
+        .collect()
+}
+
+fn pin_world(p: &Pin, h: &HashMap<u64, Rect>) -> Pos2 {
+    match p.at.and_then(|i| h.get(&i)) {
+        Some(r) => r.min + vec2(p.x, p.y),
+        None => pos2(p.x, p.y),
+    }
+}
+
+// attach each listed pin to the top-most note/image under it, or free it
+fn rehost(t: &mut Tab, ids: &HashSet<u64>) {
+    let h = host_rects(t);
+    let order: Vec<u64> = t
+        .images
+        .iter()
+        .map(|m| m.id)
+        .chain(t.notes.iter().map(|n| n.id))
+        .collect();
+    for p in t.pins.iter_mut().filter(|p| ids.contains(&p.id)) {
+        let w = pin_world(p, &h);
+        let host = order.iter().rev().copied().find(|i| h[i].contains(w));
+        match host {
+            Some(i) => {
+                p.at = Some(i);
+                let o = w - h[&i].min;
+                p.x = o.x;
+                p.y = o.y;
+            }
+            None => {
+                p.at = None;
+                p.x = w.x;
+                p.y = w.y;
+            }
+        }
+    }
+}
+
+fn delete_items(t: &mut Tab, ids: &HashSet<u64>) {
+    let h = host_rects(t);
+    for p in t.pins.iter_mut() {
+        if let Some(a) = p.at {
+            if ids.contains(&a) && !ids.contains(&p.id) {
+                let w = pin_world(p, &h);
+                p.at = None;
+                p.x = w.x;
+                p.y = w.y;
+            }
+        }
+    }
+    t.notes.retain(|n| !ids.contains(&n.id));
+    t.images.retain(|m| !ids.contains(&m.id));
+    t.pins.retain(|p| !ids.contains(&p.id));
+    t.strings
+        .retain(|(a, b)| !ids.contains(a) && !ids.contains(b));
+}
+
+fn add_image(
+    dir: &Path,
+    next_id: &mut u64,
+    t: &mut Tab,
+    img: image::DynamicImage,
+    at: Vec2,
+) -> Option<u64> {
+    let img = if img.width().max(img.height()) > 1600 {
+        img.resize(1600, 1600, image::imageops::FilterType::Triangle)
+    } else {
+        img
+    };
+    *next_id += 1;
+    let id = *next_id;
+    let _ = fs::create_dir_all(dir);
+    img.save_with_format(dir.join(format!("{}.png", id)), image::ImageFormat::Png)
+        .ok()?;
+    let (pw, ph) = (img.width() as f32, img.height() as f32);
+    let w = pw.min(360.0);
+    let h = w * ph / pw;
+    t.images.push(Img {
+        id,
+        x: at.x - w / 2.0,
+        y: at.y - h / 2.0,
+        w,
+        h,
+    });
+    Some(id)
 }
 
 fn note_ui(
@@ -388,15 +567,12 @@ fn note_ui(
     note: &mut Note,
     v: &View,
     selected: bool,
+    live: bool,
     bold: &FontFamily,
-) -> NoteOut {
+) -> ItemOut {
     let z = v.z;
     let id = note.id;
-    let mut out = NoteOut {
-        delete: false,
-        front: false,
-        changed: false,
-    };
+    let mut out = ItemOut::default();
     let r = Rect::from_min_size(
         v.origin + v.pan + vec2(note.x, note.y) * z,
         vec2(note.w, note.h) * z,
@@ -417,17 +593,16 @@ fn note_ui(
     p.rect_filled(r, 0.0, BORDER);
     p.rect_filled(r.shrink(1.0), 0.0, NOTE);
 
-    // header: drag to move
-    let hr = Rect::from_min_size(r.min, vec2(r.width() - hh, hh));
-    let hresp = ui.interact(hr, Id::new(("nh", id)), Sense::click_and_drag());
-    if hresp.dragged() {
-        let d = hresp.drag_delta() / z;
-        note.x += d.x;
-        note.y += d.y;
-        out.changed = true;
-    }
-    if hresp.clicked() || hresp.drag_started() {
-        out.front = true;
+    // header: drag to move (the board moves the whole selection)
+    if live {
+        let hr = Rect::from_min_size(r.min, vec2(r.width() - hh, hh));
+        let hresp = ui.interact(hr, Id::new(("nh", id)), Sense::click_and_drag());
+        if hresp.dragged() {
+            out.drag = hresp.drag_delta() / z;
+        }
+        out.started |= hresp.drag_started();
+        out.stopped |= hresp.drag_stopped();
+        out.clicked |= hresp.clicked();
     }
     p.text(
         pos2(r.min.x + 8.0 * z, r.min.y + hh / 2.0),
@@ -437,95 +612,226 @@ fn note_ui(
         Color32::from_black_alpha(110),
     );
 
-    // body: rich text editor
     let br = Rect::from_min_max(r.min + vec2(10.0 * z, hh), r.max - vec2(10.0 * z, 6.0 * z));
-    let tid = Id::new(("nt", id));
-    let bresp = ui.interact(br, Id::new(("nb", id)), Sense::click());
-    if bresp.clicked() {
-        ui.memory_mut(|m| m.request_focus(tid));
-        out.front = true;
-    }
-    let before = note.text.clone();
-    let size = FS * z;
-    let runs = note.runs.clone();
-    let bold_f = bold.clone();
-    let mut layouter = |ui: &egui::Ui, text: &str, wrap: f32| {
-        ui.fonts(|f| f.layout_job(build_job(text, &runs, size, wrap, &bold_f)))
-    };
-    let mut fmt_changed = false;
-    ui.scope_builder(egui::UiBuilder::new().max_rect(br), |ui| {
-        ui.set_clip_rect(br.intersect(ui.clip_rect()));
-        egui::ScrollArea::vertical()
-            .id_salt(("ns", id))
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let te = egui::TextEdit::multiline(&mut note.text)
-                    .id(tid)
-                    .frame(false)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(1)
-                    .layouter(&mut layouter)
-                    .show(ui);
-                if te.response.has_focus() {
-                    if let Some(cr) = te.cursor_range {
-                        let a = cr.primary.index;
-                        let b = cr.secondary.index;
-                        note.sel = (a.min(b), a.max(b));
-                    }
-                    for (k, which) in [(Key::B, 0u8), (Key::I, 1), (Key::U, 2)] {
-                        if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, k)) {
-                            toggle(note, which);
-                            fmt_changed = true;
+    if live {
+        // body: rich text editor
+        let tid = Id::new(("nt", id));
+        let bresp = ui.interact(br, Id::new(("nb", id)), Sense::click());
+        if bresp.clicked() {
+            ui.memory_mut(|m| m.request_focus(tid));
+            out.clicked = true;
+        }
+        let before = note.text.clone();
+        let size = FS * z;
+        let runs = note.runs.clone();
+        let bold_f = bold.clone();
+        let mut layouter = |ui: &egui::Ui, text: &str, wrap: f32| {
+            ui.fonts(|f| f.layout_job(build_job(text, &runs, size, wrap, &bold_f)))
+        };
+        let mut fmt_changed = false;
+        ui.scope_builder(egui::UiBuilder::new().max_rect(br), |ui| {
+            ui.set_clip_rect(br.intersect(ui.clip_rect()));
+            egui::ScrollArea::vertical()
+                .id_salt(("ns", id))
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let te = egui::TextEdit::multiline(&mut note.text)
+                        .id(tid)
+                        .frame(false)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(1)
+                        .layouter(&mut layouter)
+                        .show(ui);
+                    if te.response.has_focus() {
+                        if let Some(cr) = te.cursor_range {
+                            let a = cr.primary.index;
+                            let b = cr.secondary.index;
+                            note.sel = (a.min(b), a.max(b));
+                        }
+                        for (k, which) in [(Key::B, 0u8), (Key::I, 1), (Key::U, 2)] {
+                            if ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, k)) {
+                                toggle(note, which);
+                                fmt_changed = true;
+                            }
                         }
                     }
-                }
-                if te.response.clicked() || te.response.gained_focus() {
-                    out.front = true;
-                }
-                if te.response.context_menu(|ui| format_menu(ui, note)) == Some(true) {
-                    fmt_changed = true;
-                }
-            });
-    });
-    if fmt_changed {
-        ui.memory_mut(|m| m.request_focus(tid));
-        out.changed = true;
-    }
-    if note.text != before {
-        reconcile(note, &before);
-        out.changed = true;
+                    if te.response.clicked() || te.response.gained_focus() {
+                        out.clicked = true;
+                    }
+                    if te.response.context_menu(|ui| format_menu(ui, note)) == Some(true) {
+                        fmt_changed = true;
+                    }
+                });
+        });
+        if fmt_changed {
+            ui.memory_mut(|m| m.request_focus(tid));
+            out.changed = true;
+        }
+        if note.text != before {
+            reconcile(note, &before);
+            out.changed = true;
+        }
+    } else {
+        // read-only paint while the Pin/Hand tool is active
+        let job = build_job(&note.text, &note.runs, FS * z, br.width(), bold);
+        let g = ui.fonts(|f| f.layout_job(job));
+        ui.painter_at(br).galley(br.min, g, INK);
     }
 
     // delete and resize last so they sit on top
     let xr = Rect::from_min_size(pos2(r.max.x - hh, r.min.y), vec2(hh, hh));
-    let xresp = ui.interact(xr, Id::new(("nx", id)), Sense::click());
+    let mut xhover = false;
+    if live {
+        let xresp = ui.interact(xr, Id::new(("nx", id)), Sense::click());
+        xhover = xresp.hovered();
+        if xresp.clicked() {
+            out.delete = true;
+        }
+    }
     p.text(
         xr.center(),
         Align2::CENTER_CENTER,
         "×",
         FontId::proportional(18.0 * z),
-        if xresp.hovered() {
+        if xhover {
             INK
         } else {
             Color32::from_black_alpha(130)
         },
     );
-    if xresp.clicked() {
-        out.delete = true;
+    if live {
+        let rr = Rect::from_min_size(r.max - vec2(14.0 * z, 14.0 * z), vec2(14.0 * z, 14.0 * z));
+        let rresp = ui.interact(rr, Id::new(("nr", id)), Sense::drag());
+        if selected {
+            p.rect_filled(rr, 2.0, ACC);
+        }
+        if rresp.hovered() || rresp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+        }
+        if rresp.dragged() {
+            let d = rresp.drag_delta() / z;
+            note.w = (note.w + d.x).max(80.0);
+            note.h = (note.h + d.y).max(60.0);
+            out.changed = true;
+        }
     }
-    let rr = Rect::from_min_size(r.max - vec2(14.0 * z, 14.0 * z), vec2(14.0 * z, 14.0 * z));
-    let rresp = ui.interact(rr, Id::new(("nr", id)), Sense::drag());
+    out
+}
+
+fn img_ui(
+    ui: &mut egui::Ui,
+    im: &mut Img,
+    v: &View,
+    selected: bool,
+    live: bool,
+    tex: &mut Tex,
+) -> ItemOut {
+    let z = v.z;
+    let mut out = ItemOut::default();
+    let r = Rect::from_min_size(
+        v.origin + v.pan + vec2(im.x, im.y) * z,
+        vec2(im.w, im.h) * z,
+    );
+    if !r.intersects(ui.clip_rect()) {
+        return out;
+    }
+    let p = ui.painter().clone();
     if selected {
-        p.rect_filled(rr, 2.0, ACC);
+        p.rect_filled(r.expand(2.0), 0.0, ACC);
     }
-    if rresp.hovered() || rresp.dragged() {
-        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+    match tex.get(ui.ctx(), im.id) {
+        Some(t) => p.image(
+            t,
+            r,
+            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+            Color32::WHITE,
+        ),
+        None => p.rect_filled(r, 0.0, Color32::from_gray(225)),
     }
-    if rresp.dragged() {
-        let d = rresp.drag_delta() / z;
-        note.w = (note.w + d.x).max(80.0);
-        note.h = (note.h + d.y).max(60.0);
-        out.changed = true;
+    if live {
+        let resp = ui.interact(r, Id::new(("im", im.id)), Sense::click_and_drag());
+        if resp.dragged() {
+            out.drag = resp.drag_delta() / z;
+        }
+        out.started |= resp.drag_started();
+        out.stopped |= resp.drag_stopped();
+        out.clicked |= resp.clicked();
+        resp.context_menu(|ui| {
+            if ui.button("Delete").clicked() {
+                out.delete = true;
+                ui.close_menu();
+            }
+        });
+        // resize corner keeps the aspect ratio
+        let rr = Rect::from_min_size(r.max - vec2(14.0 * z, 14.0 * z), vec2(14.0 * z, 14.0 * z));
+        let rresp = ui.interact(rr, Id::new(("ir", im.id)), Sense::drag());
+        if selected {
+            p.rect_filled(rr, 2.0, ACC);
+        }
+        if rresp.hovered() || rresp.dragged() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+        }
+        if rresp.dragged() {
+            let ratio = im.h / im.w;
+            im.w = (im.w + rresp.drag_delta().x / z).max(40.0);
+            im.h = im.w * ratio;
+            out.changed = true;
+        }
+    }
+    out
+}
+
+fn pin_ui(
+    ui: &mut egui::Ui,
+    pin: &Pin,
+    c: Pos2,
+    z: f32,
+    selected: bool,
+    live: bool,
+    can_tie: bool,
+) -> ItemOut {
+    let mut out = ItemOut::default();
+    if !ui.clip_rect().expand(24.0).contains(c) {
+        return out;
+    }
+    let rad = (7.0 * z).clamp(4.0, 14.0);
+    let p = ui.painter().clone();
+    p.circle_filled(c + vec2(1.0, 2.0), rad, Color32::from_black_alpha(60));
+    if selected {
+        p.circle_filled(c, rad + 3.0, ACC);
+    }
+    p.circle_filled(c, rad, Color32::from_rgb(0xd1, 0x34, 0x38));
+    p.circle_filled(
+        c - vec2(rad * 0.3, rad * 0.3),
+        rad * 0.3,
+        Color32::from_white_alpha(150),
+    );
+    if live {
+        let hr = Rect::from_center_size(c, Vec2::splat(rad * 2.0 + 8.0));
+        let resp = ui.interact(hr, Id::new(("pn", pin.id)), Sense::click_and_drag());
+        if resp.dragged() {
+            out.drag = resp.drag_delta() / z;
+        }
+        out.started |= resp.drag_started();
+        out.stopped |= resp.drag_stopped();
+        out.clicked |= resp.clicked();
+        resp.context_menu(|ui| {
+            if ui
+                .add_enabled(can_tie, egui::Button::new("Tie with string"))
+                .clicked()
+            {
+                out.tie = true;
+                ui.close_menu();
+            }
+            if ui.button("Cut strings").clicked() {
+                out.cut = true;
+                ui.close_menu();
+            }
+            if ui.button("Delete").clicked() {
+                out.delete = true;
+                ui.close_menu();
+            }
+        });
     }
     out
 }
@@ -534,7 +840,11 @@ fn note_ui(
 
 struct App {
     data: Data,
-    selected: Option<u64>,
+    selected: HashSet<u64>,
+    tool: Tool,
+    marquee: Option<Pos2>,
+    tex: Tex,
+    img_dir: PathBuf,
     renaming: Option<usize>,
     closed: Vec<Tab>,
     zoom_req: Option<f32>,
@@ -549,6 +859,9 @@ fn new_tab(n: usize) -> Tab {
         notes: Vec::new(),
         pan: [80.0, 80.0],
         zoom: 1.0,
+        images: Vec::new(),
+        pins: Vec::new(),
+        strings: Vec::new(),
     }
 }
 
@@ -600,9 +913,19 @@ impl App {
         if data.cur >= data.tabs.len() {
             data.cur = 0;
         }
+        let img_dir = dir.join("img");
         App {
             data,
-            selected: None,
+            selected: HashSet::new(),
+            tool: Tool::Select,
+            marquee: None,
+            tex: Tex {
+                map: HashMap::new(),
+                bad: HashSet::new(),
+                dir: img_dir.clone(),
+                loaded: false,
+            },
+            img_dir,
             renaming: None,
             closed: Vec::new(),
             zoom_req: None,
@@ -626,7 +949,7 @@ impl App {
         let n = self.data.tabs.len() + 1;
         self.data.tabs.push(new_tab(n));
         self.data.cur = self.data.tabs.len() - 1;
-        self.selected = None;
+        self.selected.clear();
         self.dirty = true;
     }
 
@@ -694,7 +1017,7 @@ impl App {
                 });
                 if let Some(i) = switch {
                     self.data.cur = i;
-                    self.selected = None;
+                    self.selected.clear();
                     self.dirty = true;
                 }
                 if add {
@@ -709,7 +1032,7 @@ impl App {
                 }
                 if let Some(i) = close {
                     let t = self.data.tabs.remove(i);
-                    if !t.notes.is_empty() {
+                    if !(t.notes.is_empty() && t.images.is_empty() && t.pins.is_empty()) {
                         self.closed.push(t);
                         if self.closed.len() > 10 {
                             self.closed.remove(0);
@@ -724,7 +1047,7 @@ impl App {
                         self.data.cur -= 1;
                     }
                     self.renaming = None;
-                    self.selected = None;
+                    self.selected.clear();
                     self.dirty = true;
                 }
             });
@@ -738,27 +1061,98 @@ impl App {
         let bold = FontFamily::Name("bold".into());
         let zoom_req = self.zoom_req.take();
         let fit = std::mem::take(&mut self.fit_req);
-        let mut selected = self.selected;
+        let tool = self.tool;
+        let kb_free = !ctx.wants_keyboard_input();
+        let space = kb_free && ctx.input(|i| i.key_down(Key::Space));
+        let hand = tool == Tool::Hand || space;
+        let live = tool == Tool::Select && !space;
+        let mut sel = std::mem::take(&mut self.selected);
         let mut dirty = false;
+        self.tex.loaded = false;
         let hover = ctx.pointer_hover_pos().filter(|p| rect.contains(*p));
-        // typing on an empty board starts a note
-        let typed: String = ctx.input(|i| {
-            i.events
-                .iter()
-                .filter_map(|e| match e {
-                    egui::Event::Text(t) => Some(t.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .concat()
+
+        let (typed, pasted, paste_key, multi, del_key, all_key, esc) = ctx.input(|i| {
+            let mut t = String::new();
+            let mut pa = String::new();
+            for e in &i.events {
+                match e {
+                    egui::Event::Text(s) => t.push_str(s),
+                    egui::Event::Paste(s) => pa.push_str(s),
+                    _ => {}
+                }
+            }
+            (
+                t,
+                pa,
+                i.modifiers.command && i.key_pressed(Key::V),
+                i.modifiers.command || i.modifiers.shift,
+                i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace),
+                i.modifiers.command && i.key_pressed(Key::A),
+                i.key_pressed(Key::Escape),
+            )
         });
-        let want_spawn = !typed.is_empty()
-            && !ctx.wants_keyboard_input()
-            && !typed.chars().all(|c| c.is_control());
+        if esc {
+            sel.clear();
+            self.tool = Tool::Select;
+        }
+
+        // images from the clipboard or dropped files
+        let mut incoming: Vec<image::DynamicImage> = Vec::new();
+        if paste_key && kb_free {
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                if let Ok(d) = cb.get_image() {
+                    if let Some(b) = image::RgbaImage::from_raw(
+                        d.width as u32,
+                        d.height as u32,
+                        d.bytes.into_owned(),
+                    ) {
+                        incoming.push(image::DynamicImage::ImageRgba8(b));
+                    }
+                }
+            }
+        }
+        for f in ctx.input(|i| i.raw.dropped_files.clone()) {
+            let img = if let Some(p) = &f.path {
+                image::open(p).ok()
+            } else if let Some(b) = &f.bytes {
+                image::load_from_memory(b).ok()
+            } else {
+                None
+            };
+            if let Some(i) = img {
+                incoming.push(i);
+            }
+        }
+
+        // pasted text or typing on the board starts a note
+        let spawn_text: Option<String> = if kb_free && incoming.is_empty() {
+            if !pasted.trim().is_empty() {
+                Some(pasted)
+            } else if tool == Tool::Select
+                && !typed.trim().is_empty()
+                && !typed.chars().all(|c| c.is_control())
+            {
+                Some(typed)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let cur = self.data.cur;
         let next_id = &mut self.data.next_id;
         let tab = &mut self.data.tabs[cur];
 
+        if all_key && kb_free {
+            sel = tab
+                .notes
+                .iter()
+                .map(|n| n.id)
+                .chain(tab.images.iter().map(|m| m.id))
+                .chain(tab.pins.iter().map(|p| p.id))
+                .collect();
+        }
         if fit {
             tab.pan = [80.0, 80.0];
             tab.zoom = 1.0;
@@ -801,19 +1195,54 @@ impl App {
                 dirty = true;
             }
         }
-        if bg.dragged_by(PointerButton::Primary) || bg.dragged_by(PointerButton::Middle) {
+        // pan: middle drag always, left drag with the Hand tool or Space held
+        if bg.dragged_by(PointerButton::Middle) || (hand && bg.dragged_by(PointerButton::Primary)) {
             let d = bg.drag_delta();
             tab.pan[0] += d.x;
             tab.pan[1] += d.y;
             dirty = true;
         }
-        if bg.clicked() {
-            selected = None;
-            ctx.memory_mut(|m| {
-                if let Some(id) = m.focused() {
-                    m.surrender_focus(id);
-                }
+        if hand && hover.is_some() {
+            ctx.set_cursor_icon(if bg.dragged() {
+                egui::CursorIcon::Grabbing
+            } else {
+                egui::CursorIcon::Grab
             });
+        }
+
+        let view = View {
+            origin: rect.min,
+            pan: vec2(tab.pan[0], tab.pan[1]),
+            z: tab.zoom,
+        };
+        let to_world = |p: Pos2| (p - view.origin - view.pan) / view.z;
+        let to_screen = |w: Pos2| view.origin + view.pan + w.to_vec2() * view.z;
+
+        if bg.clicked() {
+            if tool == Tool::Pin {
+                if let Some(sp) = bg.interact_pointer_pos() {
+                    let w = to_world(sp);
+                    *next_id += 1;
+                    let id = *next_id;
+                    tab.pins.push(Pin {
+                        id,
+                        x: w.x,
+                        y: w.y,
+                        at: None,
+                    });
+                    let ids = HashSet::from([id]);
+                    rehost(tab, &ids);
+                    sel = ids;
+                    dirty = true;
+                }
+            } else if tool == Tool::Select && !multi {
+                sel.clear();
+                ctx.memory_mut(|m| {
+                    if let Some(id) = m.focused() {
+                        m.surrender_focus(id);
+                    }
+                });
+            }
         }
 
         // dotted background
@@ -833,16 +1262,12 @@ impl App {
             }
         }
 
-        let view = View {
-            origin: rect.min,
-            pan: vec2(tab.pan[0], tab.pan[1]),
-            z: tab.zoom,
-        };
-
+        // new notes and images
         let mut spawn_at: Option<Pos2> = None;
-        if bg.double_clicked() {
+        let dbl = tool == Tool::Select && bg.double_clicked();
+        if dbl {
             spawn_at = bg.interact_pointer_pos();
-        } else if want_spawn {
+        } else if spawn_text.is_some() {
             spawn_at = Some(
                 hover
                     .map(|h| h + vec2(130.0, 100.0))
@@ -850,13 +1275,8 @@ impl App {
             );
         }
         if let Some(sp_) = spawn_at {
-            let z = view.z;
-            let w = (sp_ - view.origin - view.pan) / z;
-            let text = if bg.double_clicked() {
-                String::new()
-            } else {
-                typed.clone()
-            };
+            let w = to_world(sp_);
+            let text = spawn_text.clone().unwrap_or_default();
             let n = text.chars().count();
             *next_id += 1;
             let id = *next_id;
@@ -878,7 +1298,7 @@ impl App {
                 sel: (n, n),
                 typing: None,
             });
-            selected = Some(id);
+            sel = HashSet::from([id]);
             let tid = Id::new(("nt", id));
             ctx.memory_mut(|m| m.request_focus(tid));
             let mut st = egui::text_edit::TextEditState::load(&ctx, tid).unwrap_or_default();
@@ -887,47 +1307,203 @@ impl App {
             st.store(&ctx, tid);
             dirty = true;
         }
-
-        let mut delete: Option<u64> = None;
-        let mut front: Option<u64> = None;
-        for note in tab.notes.iter_mut() {
-            let o = note_ui(ui, note, &view, selected == Some(note.id), &bold);
-            if o.delete {
-                delete = Some(note.id);
-            }
-            if o.front {
-                front = Some(note.id);
-            }
-            if o.changed {
-                dirty = true;
+        if !incoming.is_empty() {
+            let at = to_world(hover.unwrap_or(rect.center())).to_vec2();
+            sel.clear();
+            for (k, img) in incoming.into_iter().enumerate() {
+                let off = vec2(24.0, 24.0) * k as f32;
+                if let Some(id) = add_image(&self.img_dir, next_id, tab, img, at + off) {
+                    sel.insert(id);
+                    dirty = true;
+                }
             }
         }
-        if let Some(id) = delete {
-            tab.notes.retain(|n| n.id != id);
-            if selected == Some(id) {
-                selected = None;
+
+        // items: images, notes, strings, pins (bottom to top)
+        let hosts = host_rects(tab);
+        let pw: HashMap<u64, Pos2> = tab
+            .pins
+            .iter()
+            .map(|p| (p.id, pin_world(p, &hosts)))
+            .collect();
+        let mut acts: Vec<(u64, ItemOut)> = Vec::new();
+        for m in tab.images.iter_mut() {
+            let o = img_ui(ui, m, &view, sel.contains(&m.id), live, &mut self.tex);
+            acts.push((m.id, o));
+        }
+        for n in tab.notes.iter_mut() {
+            let o = note_ui(ui, n, &view, sel.contains(&n.id), live, &bold);
+            acts.push((n.id, o));
+        }
+        let string_col = Color32::from_rgb(0xc0, 0x28, 0x2d);
+        for (a, b) in &tab.strings {
+            if let (Some(&pa), Some(&pb)) = (pw.get(a), pw.get(b)) {
+                painter.line_segment(
+                    [to_screen(pa), to_screen(pb)],
+                    Stroke::new((2.0 * view.z).max(1.0), string_col),
+                );
             }
-            dirty = true;
-        } else if let Some(id) = front {
-            selected = Some(id);
-            if let Some(i) = tab.notes.iter().position(|n| n.id == id) {
+        }
+        let sel_pins: Vec<u64> = tab
+            .pins
+            .iter()
+            .filter(|p| sel.contains(&p.id))
+            .map(|p| p.id)
+            .collect();
+        let tie_ok = sel_pins.len() == 2
+            && !tab.strings.iter().any(|&(a, b)| {
+                (a == sel_pins[0] && b == sel_pins[1]) || (a == sel_pins[1] && b == sel_pins[0])
+            });
+        for p in tab.pins.iter() {
+            let c = to_screen(pw[&p.id]);
+            let can_tie = tie_ok && sel_pins.contains(&p.id);
+            let o = pin_ui(ui, p, c, view.z, sel.contains(&p.id), live, can_tie);
+            acts.push((p.id, o));
+        }
+
+        // selection from clicks and drag starts
+        for (id, o) in &acts {
+            if o.started || o.clicked {
+                if multi {
+                    if o.clicked && !sel.remove(id) {
+                        sel.insert(*id);
+                    } else if o.started {
+                        sel.insert(*id);
+                    }
+                } else if !sel.contains(id) || (o.clicked && sel.len() > 1) {
+                    sel.clear();
+                    sel.insert(*id);
+                }
+            }
+        }
+        // bring the clicked note/image to the front
+        if let Some((id, _)) = acts.iter().find(|(_, o)| o.clicked || o.started) {
+            if let Some(i) = tab.notes.iter().position(|n| n.id == *id) {
                 if i + 1 != tab.notes.len() {
                     let n = tab.notes.remove(i);
                     tab.notes.push(n);
                 }
+            } else if let Some(i) = tab.images.iter().position(|m| m.id == *id) {
+                if i + 1 != tab.images.len() {
+                    let m = tab.images.remove(i);
+                    tab.images.push(m);
+                }
             }
         }
-        if tab.notes.is_empty() {
-            let h = "Just start typing to add a note";
+        // move the whole selection
+        let mv = acts.iter().fold(Vec2::ZERO, |a, (_, o)| a + o.drag);
+        if mv != Vec2::ZERO {
+            for n in tab.notes.iter_mut().filter(|n| sel.contains(&n.id)) {
+                n.x += mv.x;
+                n.y += mv.y;
+            }
+            for m in tab.images.iter_mut().filter(|m| sel.contains(&m.id)) {
+                m.x += mv.x;
+                m.y += mv.y;
+            }
+            // pins riding on a selected host move with it already
+            for p in tab.pins.iter_mut().filter(|p| sel.contains(&p.id)) {
+                if p.at.map_or(false, |h| sel.contains(&h)) {
+                    continue;
+                }
+                p.x += mv.x;
+                p.y += mv.y;
+            }
+            dirty = true;
+        }
+        if acts.iter().any(|(_, o)| o.stopped) {
+            rehost(tab, &sel);
+            dirty = true;
+        }
+        if acts.iter().any(|(_, o)| o.changed) {
+            dirty = true;
+        }
+        // tie / cut strings
+        for (id, o) in &acts {
+            if o.tie && tie_ok {
+                tab.strings.push((sel_pins[0], sel_pins[1]));
+                dirty = true;
+            }
+            if o.cut {
+                tab.strings.retain(|&(a, b)| a != *id && b != *id);
+                dirty = true;
+            }
+        }
+        // delete
+        let mut del: HashSet<u64> = acts
+            .iter()
+            .filter(|(_, o)| o.delete)
+            .map(|(id, _)| *id)
+            .collect();
+        if kb_free && del_key && !sel.is_empty() {
+            del = sel.clone();
+        }
+        if !del.is_empty() {
+            delete_items(tab, &del);
+            sel.retain(|id| !del.contains(id));
+            dirty = true;
+        }
+
+        // marquee selection
+        if live && bg.drag_started_by(PointerButton::Primary) {
+            self.marquee = bg.interact_pointer_pos();
+        }
+        if let (Some(s), Some(now)) = (self.marquee, ctx.pointer_latest_pos()) {
+            let mr = Rect::from_two_pos(s, now);
+            if bg.drag_stopped() {
+                let rs = |x: f32, y: f32, w: f32, h: f32| {
+                    Rect::from_min_size(to_screen(pos2(x, y)), vec2(w, h) * view.z)
+                };
+                let mut hit: HashSet<u64> = HashSet::new();
+                for n in &tab.notes {
+                    if rs(n.x, n.y, n.w, n.h).intersects(mr) {
+                        hit.insert(n.id);
+                    }
+                }
+                for m in &tab.images {
+                    if rs(m.x, m.y, m.w, m.h).intersects(mr) {
+                        hit.insert(m.id);
+                    }
+                }
+                for p in &tab.pins {
+                    if let Some(&w) = pw.get(&p.id) {
+                        if Rect::from_center_size(to_screen(w), Vec2::splat(16.0)).intersects(mr) {
+                            hit.insert(p.id);
+                        }
+                    }
+                }
+                if multi {
+                    sel.extend(hit);
+                } else {
+                    sel = hit;
+                }
+                self.marquee = None;
+            } else if bg.dragged() {
+                painter.rect_filled(mr, 0.0, ACC.gamma_multiply(0.12));
+                painter.add(egui::Shape::closed_line(
+                    vec![
+                        mr.left_top(),
+                        mr.right_top(),
+                        mr.right_bottom(),
+                        mr.left_bottom(),
+                    ],
+                    Stroke::new(1.0, ACC),
+                ));
+            } else {
+                self.marquee = None;
+            }
+        }
+
+        if tab.notes.is_empty() && tab.images.is_empty() && tab.pins.is_empty() {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                h,
+                "Just start typing to add a note, or paste / drop an image",
                 FontId::proportional(15.0),
                 Color32::from_black_alpha(100),
             );
         }
-        self.selected = selected;
+        self.selected = sel;
         if dirty {
             self.dirty = true;
         }
@@ -937,6 +1513,21 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.top_bar(ctx);
+        egui::TopBottomPanel::top("tools").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                for (t, l) in [
+                    (Tool::Select, "Select"),
+                    (Tool::Pin, "Pin"),
+                    (Tool::Hand, "Hand"),
+                ] {
+                    ui.selectable_value(&mut self.tool, t, l);
+                }
+                ui.separator();
+                ui.weak(
+                    "Ctrl+click or drag a box to multi-select · right-click a pin to tie strings",
+                );
+            });
+        });
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(BG))
             .show(ctx, |ui| self.board(ui));
