@@ -107,11 +107,65 @@ struct Tab {
     strokes: Vec<Ink>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct Cfg {
+    dark: bool,
+    mini: bool,
+    auto: bool,
+    skip: String,
+}
+
+impl Default for Cfg {
+    fn default() -> Self {
+        Cfg {
+            dark: false,
+            mini: true,
+            auto: true,
+            skip: String::new(),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default)]
 struct Data {
     tabs: Vec<Tab>,
     cur: usize,
     next_id: u64,
+    #[serde(default)]
+    cfg: Cfg,
+}
+
+// GitHub "owner/name" that publishes the releases; update check is skipped until set
+const REPO: &str = "owner/repo";
+
+fn ver_nums(v: &str) -> (Vec<u32>, bool) {
+    let v = v.trim_start_matches('v');
+    let core = v.split('-').next().unwrap_or("");
+    (
+        core.split('.').filter_map(|x| x.parse().ok()).collect(),
+        v.contains('-'),
+    )
+}
+
+fn is_newer(tag: &str, cur: &str) -> bool {
+    let (a, ap) = ver_nums(tag);
+    let (b, bp) = ver_nums(cur);
+    a > b || (a == b && bp && !ap)
+}
+
+// uses curl.exe (ships with Windows 10+), so no HTTP/TLS crate in the binary
+fn latest_tag() -> Option<String> {
+    let url = format!("https://api.github.com/repos/{}/releases/latest", REPO);
+    let mut c = std::process::Command::new("curl.exe");
+    c.args(["-s", "-m", "6", "-H", "User-Agent: board-pad", url.as_str()]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000);
+    }
+    let out = c.output().ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    v["tag_name"].as_str().map(|t| t.to_string())
 }
 
 fn normalize(runs: &mut Vec<Run>) {
@@ -994,6 +1048,12 @@ struct App {
     marquee: Option<Pos2>,
     tex: Tex,
     img_dir: PathBuf,
+    search: Option<String>,
+    goto: Option<u64>,
+    settings_open: bool,
+    rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
+    upd: Option<String>,
+    upd_msg: String,
     brush: Brush,
     hist: Vec<Vec<Ink>>,
     redo: Vec<Vec<Ink>>,
@@ -1052,7 +1112,6 @@ fn load_fonts(ctx: &egui::Context) {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         load_fonts(&cc.egui_ctx);
-        cc.egui_ctx.set_visuals(egui::Visuals::light());
         let dir = std::env::var("APPDATA")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."))
@@ -1070,11 +1129,22 @@ impl App {
             data.cur = 0;
         }
         let img_dir = dir.join("img");
-        App {
+        cc.egui_ctx.set_visuals(if data.cfg.dark {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
+        let mut app = App {
             data,
             selected: HashSet::new(),
             tool: Tool::Select,
             marquee: None,
+            search: None,
+            goto: None,
+            settings_open: false,
+            rx: None,
+            upd: None,
+            upd_msg: String::new(),
             brush: Brush {
                 kind: Kind::Pen,
                 color: PALETTE[0],
@@ -1099,6 +1169,108 @@ impl App {
             fit_req: false,
             dirty: false,
             path,
+        };
+        if app.data.cfg.auto {
+            app.start_check(&cc.egui_ctx);
+        }
+        app
+    }
+
+    fn start_check(&mut self, ctx: &egui::Context) {
+        if REPO.starts_with("owner/") {
+            self.upd_msg = "Set REPO in main.rs first".into();
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let c = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(latest_tag());
+            c.request_repaint();
+        });
+        self.rx = Some(rx);
+        self.upd_msg = "Checking…".into();
+    }
+
+    fn settings_ui(&mut self, ctx: &egui::Context) {
+        let res = self.rx.as_ref().and_then(|r| r.try_recv().ok());
+        if let Some(res) = res {
+            self.rx = None;
+            match res {
+                Some(tag) if is_newer(&tag, env!("CARGO_PKG_VERSION")) => {
+                    self.upd_msg = format!("{} is available", tag);
+                    self.upd = Some(tag);
+                }
+                Some(_) => self.upd_msg = "You are up to date".into(),
+                None => self.upd_msg = "Could not reach GitHub".into(),
+            }
+        }
+        if let Some(tag) = self.upd.clone() {
+            if tag != self.data.cfg.skip {
+                egui::Window::new("update")
+                    .title_bar(false)
+                    .resizable(false)
+                    .anchor(Align2::LEFT_BOTTOM, vec2(12.0, -12.0))
+                    .show(ctx, |ui| {
+                        ui.label(format!("Board Pad {} is out", tag));
+                        ui.horizontal(|ui| {
+                            if ui.button("Download").clicked() {
+                                ctx.open_url(egui::OpenUrl::new_tab(format!(
+                                    "https://github.com/{}/releases/latest",
+                                    REPO
+                                )));
+                                self.upd = None;
+                            }
+                            if ui.button("Later").clicked() {
+                                self.upd = None;
+                            }
+                            if ui.button("Skip this version").clicked() {
+                                self.data.cfg.skip = tag.clone();
+                                self.upd = None;
+                                self.dirty = true;
+                            }
+                        });
+                    });
+            }
+        }
+        let mut open = self.settings_open;
+        let mut check = false;
+        egui::Window::new("Settings")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                if ui.checkbox(&mut self.data.cfg.dark, "Dark theme").changed() {
+                    ctx.set_visuals(if self.data.cfg.dark {
+                        egui::Visuals::dark()
+                    } else {
+                        egui::Visuals::light()
+                    });
+                    self.dirty = true;
+                }
+                if ui
+                    .checkbox(&mut self.data.cfg.mini, "Show minimap")
+                    .changed()
+                {
+                    self.dirty = true;
+                }
+                if ui
+                    .checkbox(&mut self.data.cfg.auto, "Check for updates on start")
+                    .changed()
+                {
+                    self.dirty = true;
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("Check now").clicked() {
+                        check = true;
+                    }
+                    ui.label(&self.upd_msg);
+                });
+                ui.separator();
+                ui.weak(format!("Board Pad {}", env!("CARGO_PKG_VERSION")));
+            });
+        self.settings_open = open;
+        if check {
+            self.data.cfg.skip.clear();
+            self.start_check(ctx);
         }
     }
 
@@ -1121,55 +1293,162 @@ impl App {
     }
 
     fn top_bar(&mut self, ctx: &egui::Context) {
+        let dark = self.data.cfg.dark;
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 let mut close: Option<usize> = None;
                 let mut switch: Option<usize> = None;
                 let mut add = false;
                 let mut reopen = false;
-                let room = (ui.available_width() - 330.0).max(100.0);
+                let room = (ui.available_width() - 420.0).max(100.0);
+                let n = self.data.tabs.len();
+                let tw = ((room - 8.0) / n as f32).clamp(40.0, 150.0);
+                let strip = Rect::from_min_size(ui.cursor().min, vec2(room, 26.0));
+                let mut reorder: Option<(usize, usize)> = None;
                 egui::ScrollArea::horizontal()
                     .id_salt("tabs")
                     .max_width(room)
                     .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            for (i, t) in self.data.tabs.iter_mut().enumerate() {
-                                if self.renaming == Some(i) {
-                                    let r = ui.add(
-                                        egui::TextEdit::singleline(&mut t.name)
-                                            .desired_width(100.0),
-                                    );
-                                    if r.lost_focus() {
-                                        self.renaming = None;
-                                        self.dirty = true;
-                                    } else {
-                                        r.request_focus();
-                                    }
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if ctx.pointer_hover_pos().map_or(false, |p| strip.contains(p)) {
+                            let d = ctx.input(|i| i.smooth_scroll_delta);
+                            if d != Vec2::ZERO {
+                                ui.scroll_with_delta(vec2(d.y + d.x, 0.0));
+                            }
+                        }
+                        let mut rects: Vec<Rect> = Vec::with_capacity(n);
+                        let mut drag_from: Option<usize> = None;
+                        let mut dropped = false;
+                        for i in 0..n {
+                            if self.renaming == Some(i) {
+                                let r = ui.add_sized(
+                                    [tw.max(100.0), 24.0],
+                                    egui::TextEdit::singleline(&mut self.data.tabs[i].name),
+                                );
+                                rects.push(r.rect);
+                                if r.lost_focus() {
+                                    self.renaming = None;
+                                    self.dirty = true;
                                 } else {
-                                    let resp = ui.selectable_label(i == self.data.cur, &t.name);
-                                    if resp.clicked() {
-                                        switch = Some(i);
-                                    }
-                                    if resp.double_clicked() {
-                                        self.renaming = Some(i);
-                                    }
-                                    if resp.middle_clicked() {
-                                        close = Some(i);
-                                    }
-                                    if ui.small_button("×").clicked() {
-                                        close = Some(i);
-                                    }
+                                    r.request_focus();
+                                }
+                                continue;
+                            }
+                            let (rect, resp) =
+                                ui.allocate_exact_size(vec2(tw, 24.0), Sense::click_and_drag());
+                            rects.push(rect);
+                            let cur = i == self.data.cur;
+                            let p = ui.painter().clone();
+                            let fill = match (dark, cur, resp.hovered()) {
+                                (false, true, _) => Color32::WHITE,
+                                (false, false, true) => Color32::from_gray(232),
+                                (false, false, false) => Color32::from_gray(222),
+                                (true, true, _) => Color32::from_gray(64),
+                                (true, false, true) => Color32::from_gray(50),
+                                (true, false, false) => Color32::from_gray(38),
+                            };
+                            p.rect_filled(rect, 4.0, fill);
+                            if cur {
+                                p.rect_filled(
+                                    Rect::from_min_size(
+                                        rect.left_bottom() - vec2(0.0, 2.0),
+                                        vec2(rect.width(), 2.0),
+                                    ),
+                                    0.0,
+                                    ACC,
+                                );
+                            }
+                            let show_x = tw >= 70.0 || cur || resp.hovered();
+                            let right = if show_x { 20.0 } else { 4.0 };
+                            let tr = Rect::from_min_max(
+                                rect.min + vec2(8.0, 0.0),
+                                pos2(rect.max.x - right, rect.max.y),
+                            );
+                            ui.painter_at(tr).text(
+                                pos2(tr.min.x, rect.center().y),
+                                Align2::LEFT_CENTER,
+                                &self.data.tabs[i].name,
+                                FontId::proportional(13.0),
+                                if dark { Color32::from_gray(230) } else { INK },
+                            );
+                            if resp.drag_started() {
+                                switch = Some(i);
+                            }
+                            if resp.dragged() || resp.drag_stopped() {
+                                drag_from = Some(i);
+                            }
+                            dropped |= resp.drag_stopped();
+                            if resp.clicked() {
+                                switch = Some(i);
+                            }
+                            if resp.double_clicked() {
+                                self.renaming = Some(i);
+                            }
+                            if resp.middle_clicked() {
+                                close = Some(i);
+                            }
+                            if show_x {
+                                let xr = Rect::from_min_size(
+                                    pos2(rect.max.x - 20.0, rect.min.y),
+                                    vec2(20.0, 24.0),
+                                );
+                                let xresp = ui.interact(xr, Id::new(("tx", i)), Sense::click());
+                                p.text(
+                                    xr.center(),
+                                    Align2::CENTER_CENTER,
+                                    "×",
+                                    FontId::proportional(14.0),
+                                    if xresp.hovered() {
+                                        INK
+                                    } else {
+                                        Color32::from_gray(130)
+                                    },
+                                );
+                                if xresp.clicked() {
+                                    close = Some(i);
+                                    switch = None;
                                 }
                             }
-                            if ui.button("+").clicked() {
-                                add = true;
+                        }
+                        // drag a tab sideways to reorder
+                        if let (Some(from), Some(px)) =
+                            (drag_from, ctx.pointer_latest_pos().map(|p| p.x))
+                        {
+                            let to = rects
+                                .iter()
+                                .enumerate()
+                                .min_by(|a, b| {
+                                    (a.1.center().x - px)
+                                        .abs()
+                                        .total_cmp(&(b.1.center().x - px).abs())
+                                })
+                                .map(|(k, _)| k)
+                                .unwrap_or(from);
+                            if dropped {
+                                reorder = Some((from, to));
+                            } else if to != from {
+                                let x = if to > from {
+                                    rects[to].max.x
+                                } else {
+                                    rects[to].min.x
+                                };
+                                ui.painter().line_segment(
+                                    [pos2(x, strip.min.y), pos2(x, strip.max.y)],
+                                    Stroke::new(2.0_f32, ACC),
+                                );
                             }
-                            if !self.closed.is_empty() && ui.button("Reopen").clicked() {
-                                reopen = true;
-                            }
-                        });
+                        }
                     });
+                if ui.button("+").clicked() {
+                    add = true;
+                }
+                if !self.closed.is_empty() && ui.button("Reopen").clicked() {
+                    reopen = true;
+                }
                 ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                    if ui.button("Settings").clicked() {
+                        self.settings_open = !self.settings_open;
+                    }
                     if ui.button("Fit").clicked() {
                         self.fit_req = true;
                     }
@@ -1186,6 +1465,24 @@ impl App {
                     self.data.cur = i;
                     self.selected.clear();
                     self.dirty = true;
+                }
+                if let Some((f, t)) = reorder {
+                    if f != t && f < self.data.tabs.len() && t < self.data.tabs.len() {
+                        let tab = self.data.tabs.remove(f);
+                        self.data.tabs.insert(t, tab);
+                        let c = self.data.cur;
+                        self.data.cur = if c == f {
+                            t
+                        } else if f < c && t >= c {
+                            c - 1
+                        } else if f > c && t <= c {
+                            c + 1
+                        } else {
+                            c
+                        };
+                        self.renaming = None;
+                        self.dirty = true;
+                    }
                 }
                 if add {
                     self.add_tab();
@@ -1225,11 +1522,91 @@ impl App {
         });
     }
 
+    fn search_ui(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| {
+            i.consume_key(Modifiers::COMMAND, Key::K) || i.consume_key(Modifiers::COMMAND, Key::F)
+        }) {
+            self.search = Some(String::new());
+        }
+        let mut pick: Option<(usize, Option<u64>)> = None;
+        let mut close = false;
+        if let Some(q) = self.search.as_mut() {
+            if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                close = true;
+            }
+            egui::Window::new("search")
+                .title_bar(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_TOP, vec2(0.0, 60.0))
+                .show(ctx, |ui| {
+                    let r = ui.add(
+                        egui::TextEdit::singleline(q)
+                            .hint_text("Search all boards")
+                            .desired_width(380.0),
+                    );
+                    r.request_focus();
+                    let ql = q.to_lowercase();
+                    if ql.is_empty() {
+                        return;
+                    }
+                    let mut hits: Vec<(usize, Option<u64>, String)> = Vec::new();
+                    for (ti, t) in self.data.tabs.iter().enumerate() {
+                        if t.name.to_lowercase().contains(&ql) {
+                            hits.push((ti, None, format!("Board: {}", t.name)));
+                        }
+                        for n in &t.notes {
+                            if hits.len() >= 40 {
+                                break;
+                            }
+                            if n.text.to_lowercase().contains(&ql) {
+                                let snip: String = n
+                                    .text
+                                    .chars()
+                                    .map(|c| if c == '\n' { ' ' } else { c })
+                                    .take(60)
+                                    .collect();
+                                hits.push((ti, Some(n.id), format!("{} · {}", t.name, snip)));
+                            }
+                        }
+                    }
+                    if hits.is_empty() {
+                        ui.weak("No results");
+                    }
+                    egui::ScrollArea::vertical()
+                        .max_height(300.0)
+                        .show(ui, |ui| {
+                            for (ti, id, label) in &hits {
+                                if ui.selectable_label(false, label).clicked() {
+                                    pick = Some((*ti, *id));
+                                }
+                            }
+                        });
+                    if ui.input(|i| i.key_pressed(Key::Enter)) {
+                        if let Some((ti, id, _)) = hits.first() {
+                            pick = Some((*ti, *id));
+                        }
+                    }
+                });
+        }
+        if let Some((ti, id)) = pick {
+            self.data.cur = ti;
+            self.goto = id;
+            self.selected.clear();
+            self.dirty = true;
+            close = true;
+        }
+        if close {
+            self.search = None;
+        }
+    }
+
     fn board(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let rect = ui.max_rect();
         let bg = ui.interact(rect, Id::new("board"), Sense::click_and_drag());
         let bold = FontFamily::Name("bold".into());
+        let dark = self.data.cfg.dark;
+        let mini = self.data.cfg.mini;
         let zoom_req = self.zoom_req.take();
         let fit = std::mem::take(&mut self.fit_req);
         let tool = self.tool;
@@ -1354,6 +1731,14 @@ impl App {
         if redo {
             if let Some(next) = self.redo.pop() {
                 self.hist.push(std::mem::replace(&mut tab.strokes, next));
+                dirty = true;
+            }
+        }
+        if let Some(gid) = self.goto.take() {
+            if let Some(n) = tab.notes.iter().find(|n| n.id == gid) {
+                let c = vec2(n.x + n.w / 2.0, n.y + n.h / 2.0) * tab.zoom;
+                tab.pan = [rect.width() / 2.0 - c.x, rect.height() / 2.0 - c.y];
+                sel = HashSet::from([gid]);
                 dirty = true;
             }
         }
@@ -1562,7 +1947,15 @@ impl App {
             while x < rect.max.x {
                 let mut y = rect.min.y + oy;
                 while y < rect.max.y {
-                    painter.circle_filled(pos2(x, y), 1.0, DOT);
+                    painter.circle_filled(
+                        pos2(x, y),
+                        1.0,
+                        if dark {
+                            Color32::from_rgb(0x3a, 0x3a, 0x44)
+                        } else {
+                            DOT
+                        },
+                    );
                     y += sp;
                 }
                 x += sp;
@@ -1810,6 +2203,89 @@ impl App {
             }
         }
 
+        if mini {
+            let mr = Rect::from_min_size(
+                pos2(rect.max.x - 192.0, rect.max.y - 132.0),
+                vec2(180.0, 120.0),
+            );
+            let vt = to_world(rect.min);
+            let mut b = Rect::from_min_size(pos2(vt.x, vt.y), rect.size() / view.z);
+            let vp = b;
+            for n in &tab.notes {
+                b = b.union(Rect::from_min_size(pos2(n.x, n.y), vec2(n.w, n.h)));
+            }
+            for m in &tab.images {
+                b = b.union(Rect::from_min_size(pos2(m.x, m.y), vec2(m.w, m.h)));
+            }
+            for k in &tab.strokes {
+                for q in k.pts.iter().step_by(8) {
+                    b.extend_with(pos2(q[0], q[1]));
+                }
+            }
+            let b = b.expand(40.0);
+            let sc = (mr.width() / b.width()).min(mr.height() / b.height());
+            let map = |w: Pos2| mr.center() + (w - b.center()) * sc;
+            let mp = ui.painter_at(mr);
+            mp.rect_filled(
+                mr,
+                4.0,
+                if dark {
+                    Color32::from_rgba_unmultiplied(40, 40, 48, 235)
+                } else {
+                    Color32::from_white_alpha(235)
+                },
+            );
+            for m in &tab.images {
+                let r = Rect::from_min_size(map(pos2(m.x, m.y)), vec2(m.w, m.h) * sc);
+                mp.rect_filled(r, 0.0, Color32::from_gray(190));
+            }
+            for n in &tab.notes {
+                let r = Rect::from_min_size(map(pos2(n.x, n.y)), vec2(n.w, n.h) * sc);
+                mp.rect_filled(r, 0.0, NOTE);
+            }
+            for k in &tab.strokes {
+                let col = Color32::from_rgb(k.color[0], k.color[1], k.color[2]);
+                let pts: Vec<Pos2> = k
+                    .pts
+                    .iter()
+                    .step_by(8)
+                    .map(|q| map(pos2(q[0], q[1])))
+                    .collect();
+                if pts.len() > 1 {
+                    mp.add(egui::Shape::line(pts, Stroke::new(1.0_f32, col)));
+                }
+            }
+            let vr = Rect::from_min_max(map(vp.min), map(vp.max));
+            mp.add(egui::Shape::closed_line(
+                vec![
+                    vr.left_top(),
+                    vr.right_top(),
+                    vr.right_bottom(),
+                    vr.left_bottom(),
+                ],
+                Stroke::new(1.5_f32, ACC),
+            ));
+            mp.add(egui::Shape::closed_line(
+                vec![
+                    mr.left_top(),
+                    mr.right_top(),
+                    mr.right_bottom(),
+                    mr.left_bottom(),
+                ],
+                Stroke::new(1.0_f32, Color32::from_gray(170)),
+            ));
+            let mresp = ui.interact(mr, Id::new("mini"), Sense::click_and_drag());
+            if mresp.clicked() || mresp.dragged() {
+                if let Some(pp) = mresp.interact_pointer_pos() {
+                    let w = b.center() + (pp - mr.center()) / sc;
+                    tab.pan = [
+                        rect.width() / 2.0 - w.x * view.z,
+                        rect.height() / 2.0 - w.y * view.z,
+                    ];
+                    dirty = true;
+                }
+            }
+        }
         if draw && !space {
             if let Some(h) = hover {
                 let rad = if self.brush.kind == Kind::Eraser {
@@ -1842,7 +2318,11 @@ impl App {
                 Align2::CENTER_CENTER,
                 "Just start typing to add a note, or paste / drop an image",
                 FontId::proportional(15.0),
-                Color32::from_black_alpha(100),
+                if dark {
+                    Color32::from_white_alpha(110)
+                } else {
+                    Color32::from_black_alpha(100)
+                },
             );
         }
         self.selected = sel;
@@ -1854,6 +2334,8 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.search_ui(ctx);
+        self.settings_ui(ctx);
         self.top_bar(ctx);
         egui::TopBottomPanel::top("tools").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1866,6 +2348,10 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.tool, t, l);
                 }
                 ui.separator();
+                if ui.toggle_value(&mut self.data.cfg.mini, "Map").changed() {
+                    self.dirty = true;
+                }
+                ui.separator();
                 if self.tool == Tool::Draw {
                     ui.weak("Right-click for brush menu · [ ] size · Ctrl+Z / Ctrl+Y undo · Esc exits");
                 } else {
@@ -1876,6 +2362,8 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(if self.tool == Tool::Draw {
                 Color32::WHITE
+            } else if self.data.cfg.dark {
+                Color32::from_rgb(0x1c, 0x1c, 0x22)
             } else {
                 BG
             }))
