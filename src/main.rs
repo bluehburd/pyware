@@ -81,6 +81,16 @@ struct Pin {
     at: Option<u64>,
 }
 
+// one pen/calligraphy stroke; pts are world coords, dense enough for the eraser
+#[derive(Clone, Serialize, Deserialize)]
+struct Ink {
+    pts: Vec<[f32; 2]>,
+    color: [u8; 3],
+    size: f32,
+    alpha: u8,
+    cal: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 struct Tab {
     name: String,
@@ -93,6 +103,8 @@ struct Tab {
     pins: Vec<Pin>,
     #[serde(default)]
     strings: Vec<(u64, u64)>,
+    #[serde(default)]
+    strokes: Vec<Ink>,
 }
 
 #[derive(Serialize, Deserialize, Default)]
@@ -410,6 +422,141 @@ enum Tool {
     Select,
     Pin,
     Hand,
+    Draw,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Pen,
+    Cal,
+    Eraser,
+}
+
+struct Brush {
+    kind: Kind,
+    color: [u8; 3],
+    size: f32,
+    opacity: u8, // percent
+}
+
+fn eraser_r(b: &Brush) -> f32 {
+    b.size.max(12.0) / 2.0
+}
+
+// append a point, filling the gap so strokes stay dense
+fn add_pts(pts: &mut Vec<[f32; 2]>, p: Vec2, step: f32) {
+    if let Some(l) = pts.last().copied() {
+        let d = vec2(p.x - l[0], p.y - l[1]);
+        let len = d.length();
+        if len < step {
+            return;
+        }
+        let n = (len / step).ceil() as usize;
+        for k in 1..=n {
+            let t = k as f32 / n as f32;
+            pts.push([l[0] + d.x * t, l[1] + d.y * t]);
+        }
+    } else {
+        pts.push([p.x, p.y]);
+    }
+}
+
+fn path_steps(a: Vec2, b: Vec2, step: f32) -> Vec<Vec2> {
+    let n = ((b - a).length() / step).ceil().max(1.0) as usize;
+    (1..=n)
+        .map(|k| a + (b - a) * (k as f32 / n as f32))
+        .collect()
+}
+
+// remove the part of each stroke under the eraser, splitting strokes in two
+fn erase(v: &mut Vec<Ink>, c: Vec2, r: f32) -> bool {
+    let r2 = r * r;
+    let hit = |p: &[f32; 2]| (p[0] - c.x).powi(2) + (p[1] - c.y).powi(2) <= r2;
+    if !v.iter().any(|k| k.pts.iter().any(hit)) {
+        return false;
+    }
+    let mut out: Vec<Ink> = Vec::with_capacity(v.len() + 1);
+    for k in v.drain(..) {
+        if !k.pts.iter().any(hit) {
+            out.push(k);
+            continue;
+        }
+        let mut run: Vec<[f32; 2]> = Vec::new();
+        for p in &k.pts {
+            if hit(p) {
+                if !run.is_empty() {
+                    out.push(Ink {
+                        pts: std::mem::take(&mut run),
+                        color: k.color,
+                        size: k.size,
+                        alpha: k.alpha,
+                        cal: k.cal,
+                    });
+                }
+            } else {
+                run.push(*p);
+            }
+        }
+        if !run.is_empty() {
+            out.push(Ink {
+                pts: run,
+                color: k.color,
+                size: k.size,
+                alpha: k.alpha,
+                cal: k.cal,
+            });
+        }
+    }
+    *v = out;
+    true
+}
+
+fn paint_ink(p: &egui::Painter, ink: &Ink, org: Vec2, z: f32, clip: Rect) {
+    let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+    let pts: Vec<Pos2> = ink
+        .pts
+        .iter()
+        .map(|q| {
+            let s = pos2(q[0] * z + org.x, q[1] * z + org.y);
+            x0 = x0.min(s.x);
+            y0 = y0.min(s.y);
+            x1 = x1.max(s.x);
+            y1 = y1.max(s.y);
+            s
+        })
+        .collect();
+    let pad = ink.size * z;
+    if pts.is_empty()
+        || !Rect::from_min_max(pos2(x0 - pad, y0 - pad), pos2(x1 + pad, y1 + pad)).intersects(clip)
+    {
+        return;
+    }
+    let col = Color32::from_rgba_unmultiplied(ink.color[0], ink.color[1], ink.color[2], ink.alpha);
+    let w = (ink.size * z).max(1.0);
+    if ink.cal {
+        // flat nib held at 45 degrees
+        let a = std::f32::consts::FRAC_PI_4;
+        let n = vec2(a.cos(), -a.sin()) * w * 0.5;
+        if pts.len() == 1 {
+            p.line_segment([pts[0] - n, pts[0] + n], Stroke::new(1.5_f32, col));
+            return;
+        }
+        let mut m = egui::Mesh::default();
+        for s in pts.windows(2) {
+            let i = m.vertices.len() as u32;
+            m.colored_vertex(s[0] - n, col);
+            m.colored_vertex(s[0] + n, col);
+            m.colored_vertex(s[1] + n, col);
+            m.colored_vertex(s[1] - n, col);
+            m.add_triangle(i, i + 1, i + 2);
+            m.add_triangle(i, i + 2, i + 3);
+        }
+        p.add(egui::Shape::mesh(m));
+    } else if pts.len() == 1 {
+        p.circle_filled(pts[0], w / 2.0, col);
+    } else {
+        p.add(egui::Shape::line(pts, Stroke::new(w, col)));
+    }
 }
 
 // what one item reports back; the board applies moves/selection for the whole group
@@ -847,6 +994,12 @@ struct App {
     marquee: Option<Pos2>,
     tex: Tex,
     img_dir: PathBuf,
+    brush: Brush,
+    hist: Vec<Vec<Ink>>,
+    redo: Vec<Vec<Ink>>,
+    hist_key: (usize, usize),
+    cur_ink: Option<Ink>,
+    last_e: Option<Vec2>,
     renaming: Option<usize>,
     closed: Vec<Tab>,
     zoom_req: Option<f32>,
@@ -864,6 +1017,7 @@ fn new_tab(n: usize) -> Tab {
         images: Vec::new(),
         pins: Vec::new(),
         strings: Vec::new(),
+        strokes: Vec::new(),
     }
 }
 
@@ -921,6 +1075,17 @@ impl App {
             selected: HashSet::new(),
             tool: Tool::Select,
             marquee: None,
+            brush: Brush {
+                kind: Kind::Pen,
+                color: PALETTE[0],
+                size: 4.0,
+                opacity: 100,
+            },
+            hist: Vec::new(),
+            redo: Vec::new(),
+            hist_key: (0, 0),
+            cur_ink: None,
+            last_e: None,
             tex: Tex {
                 map: HashMap::new(),
                 bad: HashSet::new(),
@@ -1034,7 +1199,11 @@ impl App {
                 }
                 if let Some(i) = close {
                     let t = self.data.tabs.remove(i);
-                    if !(t.notes.is_empty() && t.images.is_empty() && t.pins.is_empty()) {
+                    if !(t.notes.is_empty()
+                        && t.images.is_empty()
+                        && t.pins.is_empty()
+                        && t.strokes.is_empty())
+                    {
                         self.closed.push(t);
                         if self.closed.len() > 10 {
                             self.closed.remove(0);
@@ -1096,6 +1265,36 @@ impl App {
         if esc {
             sel.clear();
             self.tool = Tool::Select;
+            self.cur_ink = None;
+        }
+        let draw = tool == Tool::Draw && !esc;
+        if self.hist_key != (self.data.cur, self.data.tabs.len()) {
+            self.hist.clear();
+            self.redo.clear();
+            self.hist_key = (self.data.cur, self.data.tabs.len());
+        }
+        let (undo, redo) = if kb_free {
+            ctx.input_mut(|i| {
+                let r = i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
+                    || i.consume_key(Modifiers::COMMAND, Key::Y);
+                (!r && i.consume_key(Modifiers::COMMAND, Key::Z), r)
+            })
+        } else {
+            (false, false)
+        };
+        if kb_free && draw {
+            let (lo, hi) = ctx.input(|i| {
+                (
+                    i.key_pressed(Key::OpenBracket),
+                    i.key_pressed(Key::CloseBracket),
+                )
+            });
+            if lo {
+                self.brush.size = (self.brush.size * 0.8).max(1.0);
+            }
+            if hi {
+                self.brush.size = (self.brush.size * 1.25).min(80.0);
+            }
         }
 
         // images from the clipboard or dropped files
@@ -1146,6 +1345,18 @@ impl App {
         let next_id = &mut self.data.next_id;
         let tab = &mut self.data.tabs[cur];
 
+        if undo {
+            if let Some(prev) = self.hist.pop() {
+                self.redo.push(std::mem::replace(&mut tab.strokes, prev));
+                dirty = true;
+            }
+        }
+        if redo {
+            if let Some(next) = self.redo.pop() {
+                self.hist.push(std::mem::replace(&mut tab.strokes, next));
+                dirty = true;
+            }
+        }
         if all_key && kb_free {
             sel = tab
                 .notes
@@ -1237,6 +1448,24 @@ impl App {
                     sel = ids;
                     dirty = true;
                 }
+            } else if draw && !space {
+                if let Some(sp) = bg.interact_pointer_pos() {
+                    let w = to_world(sp);
+                    self.hist.push(tab.strokes.clone());
+                    self.redo.clear();
+                    if self.brush.kind == Kind::Eraser {
+                        erase(&mut tab.strokes, w, eraser_r(&self.brush));
+                    } else {
+                        tab.strokes.push(Ink {
+                            pts: vec![[w.x, w.y]],
+                            color: self.brush.color,
+                            size: self.brush.size,
+                            alpha: (self.brush.opacity as f32 * 2.55) as u8,
+                            cal: self.brush.kind == Kind::Cal,
+                        });
+                    }
+                    dirty = true;
+                }
             } else if tool == Tool::Select && !multi {
                 sel.clear();
                 ctx.memory_mut(|m| {
@@ -1247,10 +1476,86 @@ impl App {
             }
         }
 
+        // drawing: pen, calligraphy, partial eraser
+        if draw && !space {
+            let er = eraser_r(&self.brush);
+            let step = (self.brush.size * 0.4).clamp(1.5, 6.0);
+            if bg.drag_started_by(PointerButton::Primary) {
+                self.hist.push(tab.strokes.clone());
+                if self.hist.len() > 60 {
+                    self.hist.remove(0);
+                }
+                self.redo.clear();
+                if let Some(s) = ctx.input(|i| i.pointer.press_origin()).map(to_world) {
+                    if self.brush.kind == Kind::Eraser {
+                        self.last_e = Some(s);
+                        dirty |= erase(&mut tab.strokes, s, er);
+                    } else {
+                        let mut pts = Vec::new();
+                        add_pts(&mut pts, s, step);
+                        self.cur_ink = Some(Ink {
+                            pts,
+                            color: self.brush.color,
+                            size: self.brush.size,
+                            alpha: (self.brush.opacity as f32 * 2.55) as u8,
+                            cal: self.brush.kind == Kind::Cal,
+                        });
+                    }
+                }
+            }
+            if bg.dragged_by(PointerButton::Primary) {
+                if let Some(now) = ctx.pointer_latest_pos().map(to_world) {
+                    if self.brush.kind == Kind::Eraser {
+                        if let Some(l) = self.last_e {
+                            for q in path_steps(l, now, er * 0.5) {
+                                dirty |= erase(&mut tab.strokes, q, er);
+                            }
+                        }
+                        self.last_e = Some(now);
+                    } else if let Some(ink) = &mut self.cur_ink {
+                        add_pts(&mut ink.pts, now, step);
+                    }
+                }
+            }
+            if bg.drag_stopped_by(PointerButton::Primary) {
+                if let Some(ink) = self.cur_ink.take() {
+                    tab.strokes.push(ink);
+                    dirty = true;
+                }
+                self.last_e = None;
+            }
+        }
+        if draw {
+            bg.context_menu(|ui| {
+                let b = &mut self.brush;
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut b.kind, Kind::Pen, "Pen");
+                    ui.selectable_value(&mut b.kind, Kind::Cal, "Calligraphy");
+                    ui.selectable_value(&mut b.kind, Kind::Eraser, "Eraser");
+                });
+                ui.horizontal(|ui| {
+                    for c in PALETTE {
+                        let col = Color32::from_rgb(c[0], c[1], c[2]);
+                        let btn =
+                            ui.add(egui::Button::new("").fill(col).min_size(vec2(20.0, 20.0)));
+                        if btn.clicked() {
+                            b.color = c;
+                            if b.kind == Kind::Eraser {
+                                b.kind = Kind::Pen;
+                            }
+                        }
+                    }
+                    ui.color_edit_button_srgb(&mut b.color);
+                });
+                ui.add(egui::Slider::new(&mut b.size, 1.0..=80.0).text("Size"));
+                ui.add(egui::Slider::new(&mut b.opacity, 5..=100).text("Opacity %"));
+            });
+        }
+
         // dotted background
         let painter = ui.painter_at(rect);
         let sp = 24.0 * tab.zoom;
-        if sp >= 12.0 {
+        if sp >= 12.0 && !draw {
             let ox = tab.pan[0].rem_euclid(sp);
             let oy = tab.pan[1].rem_euclid(sp);
             let mut x = rect.min.x + ox;
@@ -1336,6 +1641,15 @@ impl App {
         for n in tab.notes.iter_mut() {
             let o = note_ui(ui, n, &view, sel.contains(&n.id), live, &bold);
             acts.push((n.id, o));
+        }
+        {
+            let org = view.origin.to_vec2() + view.pan;
+            for k in &tab.strokes {
+                paint_ink(&painter, k, org, view.z, rect);
+            }
+            if let Some(k) = &self.cur_ink {
+                paint_ink(&painter, k, org, view.z, rect);
+            }
         }
         let string_col = Color32::from_rgb(0xc0, 0x28, 0x2d);
         for (a, b) in &tab.strings {
@@ -1496,7 +1810,33 @@ impl App {
             }
         }
 
-        if tab.notes.is_empty() && tab.images.is_empty() && tab.pins.is_empty() {
+        if draw && !space {
+            if let Some(h) = hover {
+                let rad = if self.brush.kind == Kind::Eraser {
+                    eraser_r(&self.brush)
+                } else {
+                    self.brush.size / 2.0
+                } * view.z;
+                painter.circle_stroke(
+                    h,
+                    rad.max(2.0),
+                    Stroke::new(1.0_f32, Color32::from_black_alpha(170)),
+                );
+                painter.text(
+                    h + vec2(rad.max(2.0) + 8.0, 10.0),
+                    Align2::LEFT_CENTER,
+                    format!("{:.0}px · {}%", self.brush.size, self.brush.opacity),
+                    FontId::proportional(11.0),
+                    Color32::from_black_alpha(150),
+                );
+                ctx.set_cursor_icon(egui::CursorIcon::Crosshair);
+            }
+        }
+        if tab.notes.is_empty()
+            && tab.images.is_empty()
+            && tab.pins.is_empty()
+            && tab.strokes.is_empty()
+        {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
@@ -1521,17 +1861,24 @@ impl eframe::App for App {
                     (Tool::Select, "Select"),
                     (Tool::Pin, "Pin"),
                     (Tool::Hand, "Hand"),
+                    (Tool::Draw, "Draw"),
                 ] {
                     ui.selectable_value(&mut self.tool, t, l);
                 }
                 ui.separator();
-                ui.weak(
-                    "Ctrl+click or drag a box to multi-select · right-click a pin to tie strings",
-                );
+                if self.tool == Tool::Draw {
+                    ui.weak("Right-click for brush menu · [ ] size · Ctrl+Z / Ctrl+Y undo · Esc exits");
+                } else {
+                    ui.weak("Ctrl+click or drag a box to multi-select · right-click a pin to tie strings");
+                }
             });
         });
         egui::CentralPanel::default()
-            .frame(egui::Frame::default().fill(BG))
+            .frame(egui::Frame::default().fill(if self.tool == Tool::Draw {
+                Color32::WHITE
+            } else {
+                BG
+            }))
             .show(ctx, |ui| self.board(ui));
         // save right away, except mid-drag (saved on release)
         if self.dirty && !ctx.input(|i| i.pointer.any_down()) {
