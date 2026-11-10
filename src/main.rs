@@ -11,11 +11,14 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    sync::mpsc::{channel, Sender},
+    thread::JoinHandle,
+    time::{Duration, Instant},
 };
 
 const NOTE: Color32 = Color32::from_rgb(0xfe, 0xff, 0x9c);
 const INK: Color32 = Color32::from_rgb(0x1a, 0x1a, 0x1a);
-const BORDER: Color32 = Color32::from_rgb(0xd6, 0xd6, 0x8a);
+const BORDER: Color32 = Color32::from_rgb(0xd6, 0xd6, 0xd6);
 const BG: Color32 = Color32::from_rgb(0xf7, 0xf7, 0xf9);
 const DOT: Color32 = Color32::from_rgb(0xc4, 0xc4, 0xc8);
 const ACC: Color32 = Color32::from_rgb(0x5b, 0x5b, 0xd6);
@@ -84,6 +87,8 @@ struct Pin {
 // one pen/calligraphy stroke; pts are world coords, dense enough for the eraser
 #[derive(Clone, Serialize, Deserialize)]
 struct Ink {
+    #[serde(default)]
+    id: u64,
     pts: Vec<[f32; 2]>,
     color: [u8; 3],
     size: f32,
@@ -93,6 +98,8 @@ struct Ink {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Tab {
+    #[serde(default)]
+    id: u64,
     name: String,
     notes: Vec<Note>,
     pan: [f32; 2],
@@ -133,6 +140,115 @@ struct Data {
     next_id: u64,
     #[serde(default)]
     cfg: Cfg,
+}
+
+// ---------- storage: one file per board, written by a background thread ----------
+
+#[derive(Clone, Serialize, Deserialize)]
+struct Meta {
+    order: Vec<u64>,
+    cur: usize,
+    next_id: u64,
+    cfg: Cfg,
+}
+
+enum Job {
+    Tab(u64, Tab),
+    Meta(Meta),
+    Del(u64),
+    Quit,
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) {
+    let tmp = path.with_extension("tmp");
+    if fs::write(&tmp, bytes).is_ok() {
+        let _ = fs::rename(&tmp, path);
+    }
+}
+
+// the writer keeps only the newest snapshot per board, so a burst of edits costs one write
+fn spawn_writer(dir: PathBuf) -> (Sender<Job>, JoinHandle<()>) {
+    let (tx, rx) = channel::<Job>();
+    let h = std::thread::spawn(move || loop {
+        let Ok(first) = rx.recv() else { break };
+        let mut jobs = vec![first];
+        while let Ok(j) = rx.try_recv() {
+            jobs.push(j);
+        }
+        let mut tabs: HashMap<u64, Tab> = HashMap::new();
+        let mut dels: Vec<u64> = Vec::new();
+        let mut meta: Option<Meta> = None;
+        let mut quit = false;
+        for j in jobs {
+            match j {
+                Job::Tab(id, t) => {
+                    tabs.insert(id, t);
+                }
+                Job::Meta(m) => meta = Some(m),
+                Job::Del(id) => {
+                    tabs.remove(&id);
+                    dels.push(id);
+                }
+                Job::Quit => quit = true,
+            }
+        }
+        for id in dels {
+            let _ = fs::remove_file(dir.join(format!("tab-{}.json", id)));
+        }
+        for (id, t) in tabs {
+            if let Ok(b) = serde_json::to_vec(&t) {
+                write_atomic(&dir.join(format!("tab-{}.json", id)), &b);
+            }
+        }
+        if let Some(m) = meta {
+            if let Ok(b) = serde_json::to_vec(&m) {
+                write_atomic(&dir.join("meta.json"), &b);
+            }
+        }
+        if quit {
+            break;
+        }
+    });
+    (tx, h)
+}
+
+fn load_store(dir: &Path) -> Option<Data> {
+    let meta: Meta = serde_json::from_slice(&fs::read(dir.join("meta.json")).ok()?).ok()?;
+    let mut tabs = Vec::new();
+    for id in &meta.order {
+        if let Ok(b) = fs::read(dir.join(format!("tab-{}.json", id))) {
+            if let Ok(mut t) = serde_json::from_slice::<Tab>(&b) {
+                t.id = *id;
+                tabs.push(t);
+            }
+        }
+    }
+    Some(Data {
+        tabs,
+        cur: meta.cur,
+        next_id: meta.next_id,
+        cfg: meta.cfg,
+    })
+}
+
+// delete image files no board refers to (runs once at start, off the UI thread)
+fn gc_images(img_dir: PathBuf, keep: HashSet<u64>) {
+    std::thread::spawn(move || {
+        if let Ok(rd) = fs::read_dir(&img_dir) {
+            for e in rd.flatten() {
+                let path = e.path();
+                let id = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok());
+                if let Some(id) = id {
+                    if !keep.contains(&id) {
+                        let _ = fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    });
 }
 
 // GitHub "owner/name" that publishes the releases; update check is skipped until set
@@ -463,6 +579,323 @@ fn format_menu(ui: &mut egui::Ui, note: &mut Note) -> bool {
     ch
 }
 
+// ---------- look: same tokens as the web version ----------
+
+fn th_pan(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(0x2b, 0x2b, 0x2b)
+    } else {
+        Color32::WHITE
+    }
+}
+fn th_act(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(0x34, 0x34, 0x5a)
+    } else {
+        Color32::from_rgb(0xec, 0xea, 0xfc)
+    }
+}
+fn th_actt(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(0xcf, 0xcf, 0xff)
+    } else {
+        Color32::from_rgb(0x3a, 0x3a, 0xa3)
+    }
+}
+fn th_acc(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(0x9a, 0x9a, 0xf5)
+    } else {
+        ACC
+    }
+}
+fn th_fg(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(0xf0, 0xf0, 0xf0)
+    } else {
+        Color32::from_rgb(0x1a, 0x1a, 0x1a)
+    }
+}
+fn th_bg(dark: bool) -> Color32 {
+    if dark {
+        Color32::from_rgb(0x1e, 0x1e, 0x1e)
+    } else {
+        BG
+    }
+}
+
+fn apply_theme(ctx: &egui::Context, dark: bool) {
+    let mut v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    v.override_text_color = Some(th_fg(dark));
+    v.panel_fill = th_bg(dark);
+    v.window_fill = th_pan(dark);
+    ctx.set_visuals(v);
+}
+
+// the white rounded floating panels
+fn pill(dark: bool, radius: f32, pad: i8) -> egui::Frame {
+    egui::Frame::new()
+        .fill(th_pan(dark))
+        .corner_radius(radius)
+        .inner_margin(egui::Margin::same(pad))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 1],
+            blur: 6,
+            spread: 0,
+            color: Color32::from_black_alpha(40),
+        })
+}
+
+fn outline(p: &egui::Painter, r: Rect) {
+    let e = r.expand(3.0);
+    p.add(egui::Shape::closed_line(
+        vec![
+            e.left_top(),
+            e.right_top(),
+            e.right_bottom(),
+            e.left_bottom(),
+        ],
+        Stroke::new(2.0_f32, ACC),
+    ));
+}
+
+// whole-board snapshots for undo/redo
+#[derive(Clone)]
+struct Snap {
+    notes: Vec<Note>,
+    images: Vec<Img>,
+    pins: Vec<Pin>,
+    strings: Vec<(u64, u64)>,
+    strokes: Vec<Ink>,
+}
+
+fn snap(t: &Tab) -> Snap {
+    Snap {
+        notes: t.notes.clone(),
+        images: t.images.clone(),
+        pins: t.pins.clone(),
+        strings: t.strings.clone(),
+        strokes: t.strokes.clone(),
+    }
+}
+
+// put a snapshot back, returning what was there
+fn restore(t: &mut Tab, s: Snap) -> Snap {
+    let old = snap(t);
+    t.notes = s.notes;
+    t.images = s.images;
+    t.pins = s.pins;
+    t.strings = s.strings;
+    t.strokes = s.strokes;
+    old
+}
+
+fn push_hist(hist: &mut Vec<Snap>, redo: &mut Vec<Snap>, t: &Tab) {
+    hist.push(snap(t));
+    if hist.len() > 50 {
+        hist.remove(0);
+    }
+    redo.clear();
+}
+
+fn hit_stroke(v: &[Ink], w: Vec2, tol: f32) -> Option<u64> {
+    v.iter().rev().find_map(|k| {
+        let r = k.size / 2.0 + tol;
+        let r2 = r * r;
+        k.pts
+            .iter()
+            .any(|p| (p[0] - w.x).powi(2) + (p[1] - w.y).powi(2) <= r2)
+            .then_some(k.id)
+    })
+}
+
+// ---------- icons (one colour, drawn with the painter) ----------
+
+#[derive(Clone, Copy)]
+enum Icon {
+    Select,
+    Pin,
+    Hand,
+    Draw,
+    Note,
+    Search,
+    Map,
+    Gear,
+    Plus,
+    Minus,
+    Fit,
+    Image,
+    Undo,
+    Redo,
+    Folder,
+    Disk,
+}
+
+fn draw_icon(p: &egui::Painter, ic: Icon, c: Pos2, col: Color32) {
+    let st = Stroke::new(1.8_f32, col);
+    let v = |x: f32, y: f32| c + vec2(x, y);
+    let closed = |pts: Vec<Pos2>| egui::Shape::closed_line(pts, st);
+    match ic {
+        Icon::Select => {
+            p.add(closed(vec![
+                v(-4.0, -7.0),
+                v(-4.0, 5.0),
+                v(-1.0, 2.0),
+                v(1.0, 7.0),
+                v(3.0, 6.0),
+                v(1.0, 1.0),
+                v(5.0, 1.0),
+            ]));
+        }
+        Icon::Pin => {
+            p.circle_filled(v(0.0, -3.0), 4.5, col);
+            p.line_segment([v(0.0, 1.0), v(0.0, 8.0)], st);
+        }
+        Icon::Hand => {
+            p.line_segment([v(-7.0, 0.0), v(7.0, 0.0)], st);
+            p.line_segment([v(0.0, -7.0), v(0.0, 7.0)], st);
+            p.circle_filled(c, 2.5, col);
+        }
+        Icon::Draw => {
+            p.line_segment([v(-5.0, 5.0), v(5.0, -5.0)], Stroke::new(3.5_f32, col));
+            p.line_segment([v(-8.0, 8.0), v(-5.0, 5.0)], Stroke::new(1.5_f32, col));
+        }
+        Icon::Note => {
+            p.add(closed(vec![
+                v(-6.0, -7.0),
+                v(6.0, -7.0),
+                v(6.0, 7.0),
+                v(-6.0, 7.0),
+            ]));
+            p.line_segment([v(-3.0, 0.0), v(3.0, 0.0)], st);
+            p.line_segment([v(0.0, -3.0), v(0.0, 3.0)], st);
+        }
+        Icon::Search => {
+            p.circle_stroke(v(-1.0, -1.0), 5.0, st);
+            p.line_segment([v(3.0, 3.0), v(7.0, 7.0)], st);
+        }
+        Icon::Map => {
+            p.add(closed(vec![
+                v(-7.0, -5.0),
+                v(7.0, -5.0),
+                v(7.0, 5.0),
+                v(-7.0, 5.0),
+            ]));
+            p.rect_filled(
+                Rect::from_center_size(v(2.0, 1.0), vec2(6.0, 4.0)),
+                1.0,
+                col,
+            );
+        }
+        Icon::Gear => {
+            p.circle_stroke(c, 5.0, st);
+            p.circle_filled(c, 1.8, col);
+            for k in 0..8 {
+                let a = k as f32 * std::f32::consts::FRAC_PI_4;
+                let d = vec2(a.cos(), a.sin());
+                p.line_segment([c + d * 5.5, c + d * 8.0], st);
+            }
+        }
+        Icon::Plus => {
+            p.line_segment([v(-6.0, 0.0), v(6.0, 0.0)], st);
+            p.line_segment([v(0.0, -6.0), v(0.0, 6.0)], st);
+        }
+        Icon::Folder => {
+            p.rect_filled(Rect::from_min_max(v(-7.0, -6.0), v(-1.0, -3.0)), 1.0, col);
+            p.rect_filled(Rect::from_min_max(v(-7.0, -4.0), v(7.0, 6.0)), 1.5, col);
+        }
+        Icon::Disk => {
+            p.rect_filled(Rect::from_min_max(v(-6.0, -6.0), v(6.0, 6.0)), 1.5, col);
+            p.rect_filled(
+                Rect::from_min_max(v(-3.0, -6.0), v(3.0, -2.0)),
+                0.0,
+                Color32::from_white_alpha(200),
+            );
+            p.rect_filled(
+                Rect::from_min_max(v(-3.5, 1.0), v(3.5, 6.0)),
+                0.0,
+                Color32::from_white_alpha(200),
+            );
+        }
+        Icon::Image => {
+            p.add(closed(vec![
+                v(-7.0, -6.0),
+                v(7.0, -6.0),
+                v(7.0, 6.0),
+                v(-7.0, 6.0),
+            ]));
+            p.circle_filled(v(-3.0, -2.0), 1.8, col);
+            p.line_segment([v(-7.0, 6.0), v(-2.0, 1.0)], st);
+            p.line_segment([v(-2.0, 1.0), v(1.0, 4.0)], st);
+            p.line_segment([v(1.0, 4.0), v(3.0, 2.0)], st);
+            p.line_segment([v(3.0, 2.0), v(7.0, 6.0)], st);
+        }
+        Icon::Undo | Icon::Redo => {
+            let f = if matches!(ic, Icon::Undo) { 1.0 } else { -1.0 };
+            p.line_segment([v(6.0 * f, 5.0), v(6.0 * f, -1.0)], st);
+            p.line_segment([v(6.0 * f, -1.0), v(-4.0 * f, -1.0)], st);
+            p.line_segment([v(-1.0 * f, -4.0), v(-4.0 * f, -1.0)], st);
+            p.line_segment([v(-1.0 * f, 2.0), v(-4.0 * f, -1.0)], st);
+        }
+        Icon::Minus => {
+            p.line_segment([v(-6.0, 0.0), v(6.0, 0.0)], st);
+        }
+        Icon::Fit => {
+            for (sx, sy) in [(-1.0_f32, -1.0_f32), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+                let k = v(sx * 6.0, sy * 6.0);
+                p.line_segment([k, k - vec2(sx * 4.0, 0.0)], st);
+                p.line_segment([k, k - vec2(0.0, sy * 4.0)], st);
+            }
+        }
+    }
+}
+
+fn icon_btn_sz(
+    ui: &mut egui::Ui,
+    ic: Icon,
+    on: bool,
+    size: f32,
+    rad: f32,
+    dark: bool,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
+    let p = ui.painter();
+    if on {
+        p.rect_filled(rect, rad, th_acc(dark));
+    } else if resp.hovered() {
+        p.rect_filled(rect, rad, Color32::from_gray(128).gamma_multiply(0.18));
+    }
+    let col = if on {
+        if dark {
+            Color32::from_rgb(0x14, 0x14, 0x3a)
+        } else {
+            Color32::WHITE
+        }
+    } else {
+        th_fg(dark)
+    };
+    draw_icon(p, ic, rect.center(), col);
+    resp
+}
+
+#[allow(dead_code)]
+fn icon_btn(ui: &mut egui::Ui, ic: Icon, on: bool) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(32.0), Sense::click());
+    let p = ui.painter();
+    if on {
+        p.rect_filled(rect, 8.0, ACC.gamma_multiply(0.18));
+    } else if resp.hovered() {
+        p.rect_filled(rect, 8.0, Color32::from_gray(128).gamma_multiply(0.18));
+    }
+    let col = if on { ACC } else { ui.visuals().text_color() };
+    draw_icon(p, ic, rect.center(), col);
+    resp
+}
+
 // ---------- board ----------
 
 struct View {
@@ -540,6 +973,7 @@ fn erase(v: &mut Vec<Ink>, c: Vec2, r: f32) -> bool {
             if hit(p) {
                 if !run.is_empty() {
                     out.push(Ink {
+                        id: 0,
                         pts: std::mem::take(&mut run),
                         color: k.color,
                         size: k.size,
@@ -553,6 +987,7 @@ fn erase(v: &mut Vec<Ink>, c: Vec2, r: f32) -> bool {
         }
         if !run.is_empty() {
             out.push(Ink {
+                id: 0,
                 pts: run,
                 color: k.color,
                 size: k.size,
@@ -565,7 +1000,7 @@ fn erase(v: &mut Vec<Ink>, c: Vec2, r: f32) -> bool {
     true
 }
 
-fn paint_ink(p: &egui::Painter, ink: &Ink, org: Vec2, z: f32, clip: Rect) {
+fn paint_ink(p: &egui::Painter, ink: &Ink, org: Vec2, z: f32, clip: Rect) -> Option<Rect> {
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     let pts: Vec<Pos2> = ink
         .pts
@@ -580,10 +1015,9 @@ fn paint_ink(p: &egui::Painter, ink: &Ink, org: Vec2, z: f32, clip: Rect) {
         })
         .collect();
     let pad = ink.size * z;
-    if pts.is_empty()
-        || !Rect::from_min_max(pos2(x0 - pad, y0 - pad), pos2(x1 + pad, y1 + pad)).intersects(clip)
-    {
-        return;
+    let bb = Rect::from_min_max(pos2(x0 - pad, y0 - pad), pos2(x1 + pad, y1 + pad));
+    if pts.is_empty() || !bb.intersects(clip) {
+        return None;
     }
     let col = Color32::from_rgba_unmultiplied(ink.color[0], ink.color[1], ink.color[2], ink.alpha);
     let w = (ink.size * z).max(1.0);
@@ -593,7 +1027,7 @@ fn paint_ink(p: &egui::Painter, ink: &Ink, org: Vec2, z: f32, clip: Rect) {
         let n = vec2(a.cos(), -a.sin()) * w * 0.5;
         if pts.len() == 1 {
             p.line_segment([pts[0] - n, pts[0] + n], Stroke::new(1.5_f32, col));
-            return;
+            return Some(bb);
         }
         let mut m = egui::Mesh::default();
         for s in pts.windows(2) {
@@ -611,6 +1045,7 @@ fn paint_ink(p: &egui::Painter, ink: &Ink, org: Vec2, z: f32, clip: Rect) {
     } else {
         p.add(egui::Shape::line(pts, Stroke::new(w, col)));
     }
+    Some(bb)
 }
 
 // what one item reports back; the board applies moves/selection for the whole group
@@ -623,6 +1058,7 @@ struct ItemOut {
     changed: bool,
     tie: bool,
     cut: bool,
+    save: bool,
     drag: Vec2,
 }
 
@@ -729,6 +1165,7 @@ fn delete_items(t: &mut Tab, ids: &HashSet<u64>) {
     t.notes.retain(|n| !ids.contains(&n.id));
     t.images.retain(|m| !ids.contains(&m.id));
     t.pins.retain(|p| !ids.contains(&p.id));
+    t.strokes.retain(|k| !ids.contains(&k.id));
     t.strings
         .retain(|(a, b)| !ids.contains(a) && !ids.contains(b));
 }
@@ -784,7 +1221,7 @@ fn note_ui(
     let hh = HEAD * z;
     let p = ui.painter().clone();
     if selected {
-        p.rect_filled(r.expand(2.0), 0.0, ACC);
+        outline(&p, r);
     }
     p.rect_filled(
         r.translate(vec2(1.0, 2.0)),
@@ -882,6 +1319,32 @@ fn note_ui(
     }
 
     // delete and resize last so they sit on top
+    let sr = Rect::from_min_size(pos2(r.max.x - 2.0 * hh, r.min.y), vec2(hh, hh));
+    let mut shover = false;
+    if live {
+        let sresp = ui.interact(sr, Id::new(("ns2", id)), Sense::click());
+        shover = sresp.hovered();
+        if sresp.clicked() {
+            out.save = true;
+        }
+    }
+    {
+        let sc = if shover {
+            INK
+        } else {
+            Color32::from_black_alpha(130)
+        };
+        let c = sr.center();
+        let u = z;
+        let st = Stroke::new((1.5 * z).max(1.0), sc);
+        p.line_segment([c + vec2(0.0, -4.0 * u), c + vec2(0.0, 3.0 * u)], st);
+        p.line_segment([c + vec2(-3.0 * u, 0.0), c + vec2(0.0, 3.0 * u)], st);
+        p.line_segment([c + vec2(0.0, 3.0 * u), c + vec2(3.0 * u, 0.0)], st);
+        p.line_segment(
+            [c + vec2(-4.0 * u, 6.0 * u), c + vec2(4.0 * u, 6.0 * u)],
+            st,
+        );
+    }
     let xr = Rect::from_min_size(pos2(r.max.x - hh, r.min.y), vec2(hh, hh));
     let mut xhover = false;
     if live {
@@ -903,10 +1366,10 @@ fn note_ui(
         },
     );
     if live {
-        let rr = Rect::from_min_size(r.max - vec2(14.0 * z, 14.0 * z), vec2(14.0 * z, 14.0 * z));
+        let rr = Rect::from_center_size(r.max, Vec2::splat(13.0 * z.max(0.8)));
         let rresp = ui.interact(rr, Id::new(("nr", id)), Sense::drag());
         if selected {
-            p.rect_filled(rr, 2.0, ACC);
+            p.rect_filled(rr, 3.0, ACC);
         }
         if rresp.hovered() || rresp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
@@ -940,17 +1403,23 @@ fn img_ui(
     }
     let p = ui.painter().clone();
     if selected {
-        p.rect_filled(r.expand(2.0), 0.0, ACC);
+        outline(&p, r);
     }
+    p.rect_filled(
+        r.translate(vec2(0.0, 1.0)).expand(1.0),
+        6.0,
+        Color32::from_black_alpha(70),
+    );
     match tex.get(ui.ctx(), im.id) {
-        Some(t) => p.image(
-            t,
-            r,
-            Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
-            Color32::WHITE,
-        ),
-        None => p.rect_filled(r, 0.0, Color32::from_gray(225)),
-    };
+        Some(t) => {
+            egui::Image::new(egui::load::SizedTexture::new(t, r.size()))
+                .corner_radius(6.0)
+                .paint_at(ui, r);
+        }
+        None => {
+            p.rect_filled(r, 6.0, Color32::from_gray(225));
+        }
+    }
     if live {
         let resp = ui.interact(r, Id::new(("im", im.id)), Sense::click_and_drag());
         if resp.dragged() {
@@ -965,11 +1434,23 @@ fn img_ui(
                 ui.close_menu();
             }
         });
+        if resp.hovered() || selected {
+            let c = r.right_top() + vec2(4.0, -4.0);
+            let xr = Rect::from_center_size(c, Vec2::splat(22.0));
+            let xresp = ui.interact(xr, Id::new(("ix", im.id)), Sense::click());
+            p.circle_filled(c, 10.0, Color32::from_rgb(0x1a, 0x1a, 0x1a));
+            let w = Stroke::new(1.5_f32, Color32::WHITE);
+            p.line_segment([c + vec2(-3.5, -3.5), c + vec2(3.5, 3.5)], w);
+            p.line_segment([c + vec2(-3.5, 3.5), c + vec2(3.5, -3.5)], w);
+            if xresp.clicked() {
+                out.delete = true;
+            }
+        }
         // resize corner keeps the aspect ratio
-        let rr = Rect::from_min_size(r.max - vec2(14.0 * z, 14.0 * z), vec2(14.0 * z, 14.0 * z));
+        let rr = Rect::from_center_size(r.max, Vec2::splat(13.0 * z.max(0.8)));
         let rresp = ui.interact(rr, Id::new(("ir", im.id)), Sense::drag());
         if selected {
-            p.rect_filled(rr, 2.0, ACC);
+            p.rect_filled(rr, 3.0, ACC);
         }
         if rresp.hovered() || rresp.dragged() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeNwSe);
@@ -1051,12 +1532,17 @@ struct App {
     search: Option<String>,
     goto: Option<u64>,
     settings_open: bool,
+    spawn_req: bool,
     rx: Option<std::sync::mpsc::Receiver<Option<String>>>,
     upd: Option<String>,
     upd_msg: String,
     brush: Brush,
-    hist: Vec<Vec<Ink>>,
-    redo: Vec<Vec<Ink>>,
+    hist: Vec<Snap>,
+    redo: Vec<Snap>,
+    undo_req: bool,
+    redo_req: bool,
+    pick_img: bool,
+    mv_strokes: bool,
     hist_key: (usize, usize),
     cur_ink: Option<Ink>,
     last_e: Option<Vec2>,
@@ -1065,11 +1551,15 @@ struct App {
     zoom_req: Option<f32>,
     fit_req: bool,
     dirty: bool,
-    path: PathBuf,
+    last_save: Instant,
+    tx: Sender<Job>,
+    writer: Option<JoinHandle<()>>,
+    gone: Vec<u64>,
 }
 
 fn new_tab(n: usize) -> Tab {
     Tab {
+        id: 0,
         name: format!("Board {}", n),
         notes: Vec::new(),
         pan: [80.0, 80.0],
@@ -1116,12 +1606,21 @@ impl App {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("."))
             .join("BoardPad");
-        let _ = fs::create_dir_all(&dir);
-        let path = dir.join("board.json");
-        let mut data: Data = fs::read_to_string(&path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let store = dir.join("store");
+        let _ = fs::create_dir_all(&store);
+        let old = dir.join("board.json");
+        let mut migrated = false;
+        let mut data: Data = match load_store(&store) {
+            Some(d) => d,
+            None => {
+                let d: Data = fs::read_to_string(&old)
+                    .ok()
+                    .and_then(|s| serde_json::from_str(&s).ok())
+                    .unwrap_or_default();
+                migrated = !d.tabs.is_empty();
+                d
+            }
+        };
         if data.tabs.is_empty() {
             data.tabs.push(new_tab(1));
         }
@@ -1129,11 +1628,8 @@ impl App {
             data.cur = 0;
         }
         let img_dir = dir.join("img");
-        cc.egui_ctx.set_visuals(if data.cfg.dark {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        });
+        let (tx, writer) = spawn_writer(store.clone());
+        apply_theme(&cc.egui_ctx, data.cfg.dark);
         let mut app = App {
             data,
             selected: HashSet::new(),
@@ -1142,6 +1638,7 @@ impl App {
             search: None,
             goto: None,
             settings_open: false,
+            spawn_req: false,
             rx: None,
             upd: None,
             upd_msg: String::new(),
@@ -1153,6 +1650,10 @@ impl App {
             },
             hist: Vec::new(),
             redo: Vec::new(),
+            undo_req: false,
+            redo_req: false,
+            pick_img: false,
+            mv_strokes: false,
             hist_key: (0, 0),
             cur_ink: None,
             last_e: None,
@@ -1168,8 +1669,22 @@ impl App {
             zoom_req: None,
             fit_req: false,
             dirty: false,
-            path,
+            last_save: Instant::now(),
+            tx,
+            writer: Some(writer),
+            gone: Vec::new(),
         };
+        if migrated {
+            app.save_all();
+            let _ = fs::rename(&old, dir.join("board.json.bak"));
+        }
+        let keep: HashSet<u64> = app
+            .data
+            .tabs
+            .iter()
+            .flat_map(|t| t.images.iter().map(|m| m.id))
+            .collect();
+        gc_images(app.img_dir.clone(), keep);
         if app.data.cfg.auto {
             app.start_check(&cc.egui_ctx);
         }
@@ -1209,7 +1724,7 @@ impl App {
                 egui::Window::new("update")
                     .title_bar(false)
                     .resizable(false)
-                    .anchor(Align2::LEFT_BOTTOM, vec2(12.0, -12.0))
+                    .anchor(Align2::CENTER_BOTTOM, vec2(0.0, -16.0))
                     .show(ctx, |ui| {
                         ui.label(format!("Board Pad {} is out", tag));
                         ui.horizontal(|ui| {
@@ -1239,11 +1754,7 @@ impl App {
             .resizable(false)
             .show(ctx, |ui| {
                 if ui.checkbox(&mut self.data.cfg.dark, "Dark theme").changed() {
-                    ctx.set_visuals(if self.data.cfg.dark {
-                        egui::Visuals::dark()
-                    } else {
-                        egui::Visuals::light()
-                    });
+                    apply_theme(ctx, self.data.cfg.dark);
                     self.dirty = true;
                 }
                 if ui
@@ -1274,14 +1785,43 @@ impl App {
         }
     }
 
-    fn save(&mut self) {
-        if let Ok(s) = serde_json::to_string(&self.data) {
-            let tmp = self.path.with_extension("tmp");
-            if fs::write(&tmp, s).is_ok() {
-                let _ = fs::rename(&tmp, &self.path);
+    fn ensure_ids(&mut self) {
+        for t in self.data.tabs.iter_mut() {
+            if t.id == 0 {
+                self.data.next_id += 1;
+                t.id = self.data.next_id;
             }
         }
+    }
+
+    fn meta(&self) -> Meta {
+        Meta {
+            order: self.data.tabs.iter().map(|t| t.id).collect(),
+            cur: self.data.cur,
+            next_id: self.data.next_id,
+            cfg: self.data.cfg.clone(),
+        }
+    }
+
+    // queue the open board and the index; the writer thread does the disk work
+    fn save(&mut self) {
+        self.ensure_ids();
+        for id in self.gone.drain(..) {
+            let _ = self.tx.send(Job::Del(id));
+        }
+        let t = &self.data.tabs[self.data.cur];
+        let _ = self.tx.send(Job::Tab(t.id, t.clone()));
+        let _ = self.tx.send(Job::Meta(self.meta()));
         self.dirty = false;
+        self.last_save = Instant::now();
+    }
+
+    fn save_all(&mut self) {
+        self.ensure_ids();
+        for t in &self.data.tabs {
+            let _ = self.tx.send(Job::Tab(t.id, t.clone()));
+        }
+        let _ = self.tx.send(Job::Meta(self.meta()));
     }
 
     fn add_tab(&mut self) {
@@ -1294,232 +1834,395 @@ impl App {
 
     fn top_bar(&mut self, ctx: &egui::Context) {
         let dark = self.data.cfg.dark;
-        egui::TopBottomPanel::top("top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let mut close: Option<usize> = None;
-                let mut switch: Option<usize> = None;
-                let mut add = false;
-                let mut reopen = false;
-                let room = (ui.available_width() - 420.0).max(100.0);
-                let n = self.data.tabs.len();
-                let tw = ((room - 8.0) / n as f32).clamp(40.0, 150.0);
-                let strip = Rect::from_min_size(ui.cursor().min, vec2(room, 26.0));
-                let mut reorder: Option<(usize, usize)> = None;
-                egui::ScrollArea::horizontal()
-                    .id_salt("tabs")
-                    .max_width(room)
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.x = 2.0;
-                        if ctx.pointer_hover_pos().map_or(false, |p| strip.contains(p)) {
-                            let d = ctx.input(|i| i.smooth_scroll_delta);
-                            if d != Vec2::ZERO {
-                                ui.scroll_with_delta(vec2(d.y + d.x, 0.0));
-                            }
-                        }
-                        let mut rects: Vec<Rect> = Vec::with_capacity(n);
-                        let mut drag_from: Option<usize> = None;
-                        let mut dropped = false;
-                        for i in 0..n {
-                            if self.renaming == Some(i) {
-                                let r = ui.add_sized(
-                                    [tw.max(100.0), 24.0],
-                                    egui::TextEdit::singleline(&mut self.data.tabs[i].name),
-                                );
-                                rects.push(r.rect);
-                                if r.lost_focus() {
-                                    self.renaming = None;
-                                    self.dirty = true;
-                                } else {
-                                    r.request_focus();
+        egui::Area::new(Id::new("tabs_pill"))
+            .anchor(Align2::LEFT_TOP, vec2(12.0, 12.0))
+            .show(ctx, |ui| {
+                pill(dark, 12.0, 4).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        let mut close: Option<usize> = None;
+                        let mut switch: Option<usize> = None;
+                        let mut add = false;
+                        let mut reopen = false;
+                        let room = (ctx.screen_rect().width() - 190.0 - 80.0).clamp(120.0, 1400.0);
+                        let n = self.data.tabs.len();
+                        let tw = ((room - 8.0) / n as f32).clamp(40.0, 150.0);
+                        let strip = Rect::from_min_size(ui.cursor().min, vec2(room, 32.0));
+                        let mut reorder: Option<(usize, usize)> = None;
+                        egui::ScrollArea::horizontal()
+                            .id_salt("tabs")
+                            .max_width(room)
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing.x = 2.0;
+                                if ctx.pointer_hover_pos().map_or(false, |p| strip.contains(p)) {
+                                    let d = ctx.input(|i| i.smooth_scroll_delta);
+                                    if d != Vec2::ZERO {
+                                        ui.scroll_with_delta(vec2(d.y + d.x, 0.0));
+                                    }
                                 }
-                                continue;
-                            }
-                            let (rect, resp) =
-                                ui.allocate_exact_size(vec2(tw, 24.0), Sense::click_and_drag());
-                            rects.push(rect);
-                            let cur = i == self.data.cur;
-                            let p = ui.painter().clone();
-                            let fill = match (dark, cur, resp.hovered()) {
-                                (false, true, _) => Color32::WHITE,
-                                (false, false, true) => Color32::from_gray(232),
-                                (false, false, false) => Color32::from_gray(222),
-                                (true, true, _) => Color32::from_gray(64),
-                                (true, false, true) => Color32::from_gray(50),
-                                (true, false, false) => Color32::from_gray(38),
-                            };
-                            p.rect_filled(rect, 4.0, fill);
-                            if cur {
-                                p.rect_filled(
-                                    Rect::from_min_size(
-                                        rect.left_bottom() - vec2(0.0, 2.0),
-                                        vec2(rect.width(), 2.0),
-                                    ),
-                                    0.0,
-                                    ACC,
-                                );
-                            }
-                            let show_x = tw >= 70.0 || cur || resp.hovered();
-                            let right = if show_x { 20.0 } else { 4.0 };
-                            let tr = Rect::from_min_max(
-                                rect.min + vec2(8.0, 0.0),
-                                pos2(rect.max.x - right, rect.max.y),
-                            );
-                            ui.painter_at(tr).text(
-                                pos2(tr.min.x, rect.center().y),
-                                Align2::LEFT_CENTER,
-                                &self.data.tabs[i].name,
-                                FontId::proportional(13.0),
-                                if dark { Color32::from_gray(230) } else { INK },
-                            );
-                            if resp.drag_started() {
-                                switch = Some(i);
-                            }
-                            if resp.dragged() || resp.drag_stopped() {
-                                drag_from = Some(i);
-                            }
-                            dropped |= resp.drag_stopped();
-                            if resp.clicked() {
-                                switch = Some(i);
-                            }
-                            if resp.double_clicked() {
-                                self.renaming = Some(i);
-                            }
-                            if resp.middle_clicked() {
-                                close = Some(i);
-                            }
-                            if show_x {
-                                let xr = Rect::from_min_size(
-                                    pos2(rect.max.x - 20.0, rect.min.y),
-                                    vec2(20.0, 24.0),
-                                );
-                                let xresp = ui.interact(xr, Id::new(("tx", i)), Sense::click());
-                                p.text(
-                                    xr.center(),
-                                    Align2::CENTER_CENTER,
-                                    "×",
-                                    FontId::proportional(14.0),
-                                    if xresp.hovered() {
-                                        INK
+                                let mut rects: Vec<Rect> = Vec::with_capacity(n);
+                                let mut drag_from: Option<usize> = None;
+                                let mut dropped = false;
+                                for i in 0..n {
+                                    if self.renaming == Some(i) {
+                                        let r = ui.add_sized(
+                                            [tw.max(100.0), 30.0],
+                                            egui::TextEdit::singleline(&mut self.data.tabs[i].name),
+                                        );
+                                        rects.push(r.rect);
+                                        if r.lost_focus() {
+                                            self.renaming = None;
+                                            self.dirty = true;
+                                        } else {
+                                            r.request_focus();
+                                        }
+                                        continue;
+                                    }
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        vec2(tw, 30.0),
+                                        Sense::click_and_drag(),
+                                    );
+                                    rects.push(rect);
+                                    let cur = i == self.data.cur;
+                                    let p = ui.painter().clone();
+                                    let fill = if cur {
+                                        th_act(dark)
+                                    } else if resp.hovered() {
+                                        Color32::from_gray(128).gamma_multiply(0.14)
                                     } else {
-                                        Color32::from_gray(130)
-                                    },
-                                );
-                                if xresp.clicked() {
-                                    close = Some(i);
-                                    switch = None;
+                                        Color32::TRANSPARENT
+                                    };
+                                    p.rect_filled(rect, 8.0, fill);
+                                    let show_x = tw >= 70.0 || cur || resp.hovered();
+                                    let right = if show_x { 20.0 } else { 4.0 };
+                                    let tr = Rect::from_min_max(
+                                        rect.min + vec2(12.0, 0.0),
+                                        pos2(rect.max.x - right, rect.max.y),
+                                    );
+                                    ui.painter_at(tr).text(
+                                        pos2(tr.min.x, rect.center().y),
+                                        Align2::LEFT_CENTER,
+                                        &self.data.tabs[i].name,
+                                        FontId::proportional(14.0),
+                                        if cur { th_actt(dark) } else { th_fg(dark) },
+                                    );
+                                    if resp.drag_started() {
+                                        switch = Some(i);
+                                    }
+                                    if resp.dragged() || resp.drag_stopped() {
+                                        drag_from = Some(i);
+                                    }
+                                    dropped |= resp.drag_stopped();
+                                    if resp.clicked() {
+                                        switch = Some(i);
+                                    }
+                                    if resp.double_clicked() {
+                                        self.renaming = Some(i);
+                                    }
+                                    if resp.middle_clicked() {
+                                        close = Some(i);
+                                    }
+                                    if show_x {
+                                        let xr = Rect::from_min_size(
+                                            pos2(rect.max.x - 20.0, rect.min.y),
+                                            vec2(22.0, 30.0),
+                                        );
+                                        let xresp =
+                                            ui.interact(xr, Id::new(("tx", i)), Sense::click());
+                                        p.text(
+                                            xr.center(),
+                                            Align2::CENTER_CENTER,
+                                            "×",
+                                            FontId::proportional(14.0),
+                                            if xresp.hovered() {
+                                                INK
+                                            } else {
+                                                Color32::from_gray(130)
+                                            },
+                                        );
+                                        if xresp.clicked() {
+                                            close = Some(i);
+                                            switch = None;
+                                        }
+                                    }
                                 }
+                                // drag a tab sideways to reorder
+                                if let (Some(from), Some(px)) =
+                                    (drag_from, ctx.pointer_latest_pos().map(|p| p.x))
+                                {
+                                    let to = rects
+                                        .iter()
+                                        .enumerate()
+                                        .min_by(|a, b| {
+                                            (a.1.center().x - px)
+                                                .abs()
+                                                .total_cmp(&(b.1.center().x - px).abs())
+                                        })
+                                        .map(|(k, _)| k)
+                                        .unwrap_or(from);
+                                    if dropped {
+                                        reorder = Some((from, to));
+                                    } else if to != from {
+                                        let x = if to > from {
+                                            rects[to].max.x
+                                        } else {
+                                            rects[to].min.x
+                                        };
+                                        ui.painter().line_segment(
+                                            [pos2(x, strip.min.y), pos2(x, strip.max.y)],
+                                            Stroke::new(2.0_f32, ACC),
+                                        );
+                                    }
+                                }
+                            });
+                        if icon_btn_sz(ui, Icon::Plus, false, 30.0, 8.0, dark).clicked() {
+                            add = true;
+                        }
+                        if !self.closed.is_empty() && ui.button("Reopen").clicked() {
+                            reopen = true;
+                        }
+                        if let Some(i) = switch {
+                            self.data.cur = i;
+                            self.selected.clear();
+                            self.dirty = true;
+                        }
+                        if let Some((f, t)) = reorder {
+                            if f != t && f < self.data.tabs.len() && t < self.data.tabs.len() {
+                                let tab = self.data.tabs.remove(f);
+                                self.data.tabs.insert(t, tab);
+                                let c = self.data.cur;
+                                self.data.cur = if c == f {
+                                    t
+                                } else if f < c && t >= c {
+                                    c - 1
+                                } else if f > c && t <= c {
+                                    c + 1
+                                } else {
+                                    c
+                                };
+                                self.renaming = None;
+                                self.dirty = true;
                             }
                         }
-                        // drag a tab sideways to reorder
-                        if let (Some(from), Some(px)) =
-                            (drag_from, ctx.pointer_latest_pos().map(|p| p.x))
-                        {
-                            let to = rects
-                                .iter()
-                                .enumerate()
-                                .min_by(|a, b| {
-                                    (a.1.center().x - px)
-                                        .abs()
-                                        .total_cmp(&(b.1.center().x - px).abs())
-                                })
-                                .map(|(k, _)| k)
-                                .unwrap_or(from);
-                            if dropped {
-                                reorder = Some((from, to));
-                            } else if to != from {
-                                let x = if to > from {
-                                    rects[to].max.x
-                                } else {
-                                    rects[to].min.x
-                                };
-                                ui.painter().line_segment(
-                                    [pos2(x, strip.min.y), pos2(x, strip.max.y)],
-                                    Stroke::new(2.0_f32, ACC),
-                                );
+                        if add {
+                            self.add_tab();
+                        }
+                        if reopen {
+                            if let Some(t) = self.closed.pop() {
+                                self.data.tabs.push(t);
+                                self.data.cur = self.data.tabs.len() - 1;
+                                self.dirty = true;
                             }
+                        }
+                        if let Some(i) = close {
+                            let t = self.data.tabs.remove(i);
+                            if t.id != 0 {
+                                self.gone.push(t.id);
+                            }
+                            if !(t.notes.is_empty()
+                                && t.images.is_empty()
+                                && t.pins.is_empty()
+                                && t.strokes.is_empty())
+                            {
+                                self.closed.push(t);
+                                if self.closed.len() > 10 {
+                                    self.closed.remove(0);
+                                }
+                            }
+                            if self.data.tabs.is_empty() {
+                                self.data.tabs.push(new_tab(1));
+                            }
+                            if self.data.cur >= self.data.tabs.len() {
+                                self.data.cur = self.data.tabs.len() - 1;
+                            } else if i < self.data.cur {
+                                self.data.cur -= 1;
+                            }
+                            self.renaming = None;
+                            self.selected.clear();
+                            self.dirty = true;
                         }
                     });
-                if ui.button("+").clicked() {
-                    add = true;
-                }
-                if !self.closed.is_empty() && ui.button("Reopen").clicked() {
-                    reopen = true;
-                }
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Settings").clicked() {
-                        self.settings_open = !self.settings_open;
-                    }
-                    if ui.button("Fit").clicked() {
-                        self.fit_req = true;
-                    }
-                    if ui.button("+").clicked() {
-                        self.zoom_req = Some(1.25);
-                    }
-                    let z = self.data.tabs[self.data.cur].zoom;
-                    ui.label(format!("{}%", (z * 100.0).round()));
-                    if ui.button("−").clicked() {
-                        self.zoom_req = Some(0.8);
-                    }
                 });
-                if let Some(i) = switch {
-                    self.data.cur = i;
-                    self.selected.clear();
-                    self.dirty = true;
-                }
-                if let Some((f, t)) = reorder {
-                    if f != t && f < self.data.tabs.len() && t < self.data.tabs.len() {
-                        let tab = self.data.tabs.remove(f);
-                        self.data.tabs.insert(t, tab);
-                        let c = self.data.cur;
-                        self.data.cur = if c == f {
-                            t
-                        } else if f < c && t >= c {
-                            c - 1
-                        } else if f > c && t <= c {
-                            c + 1
-                        } else {
-                            c
-                        };
-                        self.renaming = None;
-                        self.dirty = true;
-                    }
-                }
-                if add {
-                    self.add_tab();
-                }
-                if reopen {
-                    if let Some(t) = self.closed.pop() {
-                        self.data.tabs.push(t);
-                        self.data.cur = self.data.tabs.len() - 1;
-                        self.dirty = true;
-                    }
-                }
-                if let Some(i) = close {
-                    let t = self.data.tabs.remove(i);
-                    if !(t.notes.is_empty()
-                        && t.images.is_empty()
-                        && t.pins.is_empty()
-                        && t.strokes.is_empty())
-                    {
-                        self.closed.push(t);
-                        if self.closed.len() > 10 {
-                            self.closed.remove(0);
+            });
+    }
+
+    // floating pills, laid out like the web version:
+    // tools left, actions top right, zoom bottom right
+    fn dock(&mut self, ctx: &egui::Context) {
+        let dark = self.data.cfg.dark;
+        egui::Area::new(Id::new("tools_pill"))
+            .anchor(Align2::LEFT_CENTER, vec2(12.0, 0.0))
+            .show(ctx, |ui| {
+                pill(dark, 14.0, 6).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 4.0;
+                    let tools = [
+                        (Icon::Select, Tool::Select, "Select"),
+                        (Icon::Plus, Tool::Select, "Add note (or just start typing)"),
+                        (
+                            Icon::Pin,
+                            Tool::Pin,
+                            "Pin mode: click the board to drop a pin",
+                        ),
+                        (Icon::Draw, Tool::Draw, "Drawing mode (Esc to leave)"),
+                        (Icon::Hand, Tool::Hand, "Move board (or hold Space)"),
+                        (Icon::Image, Tool::Select, "Add image"),
+                    ];
+                    for (k, (ic, t, tip)) in tools.into_iter().enumerate() {
+                        let on = (k == 0 || k == 2 || k == 3 || k == 4) && self.tool == t;
+                        if icon_btn_sz(ui, ic, on, 40.0, 10.0, dark)
+                            .on_hover_text(tip)
+                            .clicked()
+                        {
+                            match k {
+                                1 => {
+                                    self.spawn_req = true;
+                                    self.tool = Tool::Select;
+                                }
+                                5 => self.pick_img = true,
+                                _ => self.tool = t,
+                            }
                         }
                     }
-                    if self.data.tabs.is_empty() {
-                        self.data.tabs.push(new_tab(1));
+                    let (sep, _) = ui.allocate_exact_size(vec2(40.0, 7.0), Sense::hover());
+                    ui.painter().line_segment(
+                        [
+                            pos2(sep.center().x - 12.0, sep.center().y),
+                            pos2(sep.center().x + 12.0, sep.center().y),
+                        ],
+                        Stroke::new(1.0_f32, Color32::from_gray(128).gamma_multiply(0.4)),
+                    );
+                    if icon_btn_sz(ui, Icon::Undo, false, 40.0, 10.0, dark)
+                        .on_hover_text("Undo (Ctrl+Z)")
+                        .clicked()
+                    {
+                        self.undo_req = true;
                     }
-                    if self.data.cur >= self.data.tabs.len() {
-                        self.data.cur = self.data.tabs.len() - 1;
-                    } else if i < self.data.cur {
-                        self.data.cur -= 1;
+                    if icon_btn_sz(ui, Icon::Redo, false, 40.0, 10.0, dark)
+                        .on_hover_text("Redo (Ctrl+Y)")
+                        .clicked()
+                    {
+                        self.redo_req = true;
                     }
-                    self.renaming = None;
-                    self.selected.clear();
-                    self.dirty = true;
-                }
+                });
             });
-        });
+        egui::Area::new(Id::new("acts_pill"))
+            .anchor(Align2::RIGHT_TOP, vec2(-12.0, 12.0))
+            .show(ctx, |ui| {
+                pill(dark, 12.0, 4).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if icon_btn_sz(ui, Icon::Search, false, 36.0, 8.0, dark)
+                            .on_hover_text("Search all boards (Ctrl+K)")
+                            .clicked()
+                        {
+                            self.search = Some(String::new());
+                        }
+                        if icon_btn_sz(ui, Icon::Folder, false, 36.0, 8.0, dark)
+                            .on_hover_text("Open board")
+                            .clicked()
+                        {
+                            self.open_board();
+                        }
+                        if icon_btn_sz(ui, Icon::Disk, false, 36.0, 8.0, dark)
+                            .on_hover_text("Save board to file")
+                            .clicked()
+                        {
+                            self.save_board();
+                        }
+                        if icon_btn_sz(ui, Icon::Gear, self.settings_open, 36.0, 8.0, dark)
+                            .on_hover_text("Settings")
+                            .clicked()
+                        {
+                            self.settings_open = !self.settings_open;
+                        }
+                    });
+                });
+            });
+        egui::Area::new(Id::new("zoom_pill"))
+            .anchor(Align2::RIGHT_BOTTOM, vec2(-12.0, -12.0))
+            .show(ctx, |ui| {
+                pill(dark, 12.0, 3).show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 2.0;
+                        if icon_btn_sz(ui, Icon::Minus, false, 30.0, 8.0, dark)
+                            .on_hover_text("Zoom out")
+                            .clicked()
+                        {
+                            self.zoom_req = Some(0.8);
+                        }
+                        let z = self.data.tabs[self.data.cur].zoom;
+                        ui.add_sized(
+                            [46.0, 30.0],
+                            egui::Label::new(
+                                egui::RichText::new(format!("{}%", (z * 100.0).round())).size(12.0),
+                            ),
+                        );
+                        if icon_btn_sz(ui, Icon::Plus, false, 30.0, 8.0, dark)
+                            .on_hover_text("Zoom in")
+                            .clicked()
+                        {
+                            self.zoom_req = Some(1.25);
+                        }
+                        ui.add_space(3.0);
+                        let (sep, _) = ui.allocate_exact_size(vec2(1.0, 18.0), Sense::hover());
+                        ui.painter().rect_filled(
+                            sep,
+                            0.0,
+                            Color32::from_gray(128).gamma_multiply(0.4),
+                        );
+                        ui.add_space(3.0);
+                        if icon_btn_sz(ui, Icon::Fit, false, 30.0, 8.0, dark)
+                            .on_hover_text("Reset view")
+                            .clicked()
+                        {
+                            self.fit_req = true;
+                        }
+                    });
+                });
+            });
+    }
+
+    // export the open board as a file
+    fn save_board(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_file_name("board.json")
+            .add_filter("Board", &["json"])
+            .save_file()
+        {
+            if let Ok(b) = serde_json::to_vec(&self.data.tabs[self.data.cur]) {
+                let _ = fs::write(path, b);
+            }
+        }
+    }
+
+    // import a board file as a new tab (image files are not inside it)
+    fn open_board(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Board", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+        let Some(mut t) = fs::read(path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Tab>(&b).ok())
+        else {
+            return;
+        };
+        t.id = 0;
+        let top = t
+            .notes
+            .iter()
+            .map(|n| n.id)
+            .chain(t.images.iter().map(|m| m.id))
+            .chain(t.pins.iter().map(|p| p.id))
+            .chain(t.strokes.iter().map(|k| k.id))
+            .max()
+            .unwrap_or(0);
+        self.data.next_id = self.data.next_id.max(top);
+        self.data.tabs.push(t);
+        self.data.cur = self.data.tabs.len() - 1;
+        self.selected.clear();
+        self.dirty = true;
     }
 
     fn search_ui(&mut self, ctx: &egui::Context) {
@@ -1607,6 +2310,7 @@ impl App {
         let bold = FontFamily::Name("bold".into());
         let dark = self.data.cfg.dark;
         let mini = self.data.cfg.mini;
+        let spawn_req = std::mem::take(&mut self.spawn_req);
         let zoom_req = self.zoom_req.take();
         let fit = std::mem::take(&mut self.fit_req);
         let tool = self.tool;
@@ -1617,7 +2321,12 @@ impl App {
         let mut sel = std::mem::take(&mut self.selected);
         let mut dirty = false;
         self.tex.loaded = false;
-        let hover = ctx.pointer_hover_pos().filter(|p| rect.contains(*p));
+        let hover = ctx.pointer_hover_pos().filter(|p| {
+            rect.contains(*p)
+                && !ctx
+                    .layer_id_at(*p)
+                    .map_or(false, |l| l.order != egui::Order::Background)
+        });
 
         let (typed, pasted, paste_key, multi, del_key, all_key, esc) = ctx.input(|i| {
             let mut t = String::new();
@@ -1659,6 +2368,8 @@ impl App {
         } else {
             (false, false)
         };
+        let undo = undo || std::mem::take(&mut self.undo_req);
+        let redo = redo || std::mem::take(&mut self.redo_req);
         if kb_free && draw {
             let (lo, hi) = ctx.input(|i| {
                 (
@@ -1685,6 +2396,18 @@ impl App {
                         d.bytes.into_owned(),
                     ) {
                         incoming.push(image::DynamicImage::ImageRgba8(b));
+                    }
+                }
+            }
+        }
+        if std::mem::take(&mut self.pick_img) {
+            if let Some(files) = rfd::FileDialog::new()
+                .add_filter("Images", &["png", "jpg", "jpeg", "gif"])
+                .pick_files()
+            {
+                for f in files {
+                    if let Ok(i) = image::open(f) {
+                        incoming.push(i);
                     }
                 }
             }
@@ -1722,15 +2445,25 @@ impl App {
         let next_id = &mut self.data.next_id;
         let tab = &mut self.data.tabs[cur];
 
+        for k in tab.strokes.iter_mut() {
+            if k.id == 0 {
+                *next_id += 1;
+                k.id = *next_id;
+            }
+        }
         if undo {
             if let Some(prev) = self.hist.pop() {
-                self.redo.push(std::mem::replace(&mut tab.strokes, prev));
+                let now = restore(tab, prev);
+                self.redo.push(now);
+                sel.clear();
                 dirty = true;
             }
         }
         if redo {
             if let Some(next) = self.redo.pop() {
-                self.hist.push(std::mem::replace(&mut tab.strokes, next));
+                let now = restore(tab, next);
+                self.hist.push(now);
+                sel.clear();
                 dirty = true;
             }
         }
@@ -1749,6 +2482,7 @@ impl App {
                 .map(|n| n.id)
                 .chain(tab.images.iter().map(|m| m.id))
                 .chain(tab.pins.iter().map(|p| p.id))
+                .chain(tab.strokes.iter().map(|k| k.id))
                 .collect();
         }
         if fit {
@@ -1822,6 +2556,7 @@ impl App {
                     let w = to_world(sp);
                     *next_id += 1;
                     let id = *next_id;
+                    push_hist(&mut self.hist, &mut self.redo, tab);
                     tab.pins.push(Pin {
                         id,
                         x: w.x,
@@ -1836,12 +2571,13 @@ impl App {
             } else if draw && !space {
                 if let Some(sp) = bg.interact_pointer_pos() {
                     let w = to_world(sp);
-                    self.hist.push(tab.strokes.clone());
-                    self.redo.clear();
+                    push_hist(&mut self.hist, &mut self.redo, tab);
                     if self.brush.kind == Kind::Eraser {
                         erase(&mut tab.strokes, w, eraser_r(&self.brush));
                     } else {
+                        *next_id += 1;
                         tab.strokes.push(Ink {
+                            id: *next_id,
                             pts: vec![[w.x, w.y]],
                             color: self.brush.color,
                             size: self.brush.size,
@@ -1851,13 +2587,29 @@ impl App {
                     }
                     dirty = true;
                 }
-            } else if tool == Tool::Select && !multi {
-                sel.clear();
-                ctx.memory_mut(|m| {
-                    if let Some(id) = m.focused() {
-                        m.surrender_focus(id);
+            } else if tool == Tool::Select {
+                let hitk = bg
+                    .interact_pointer_pos()
+                    .and_then(|sp| hit_stroke(&tab.strokes, to_world(sp), (8.0 / view.z).max(4.0)));
+                match hitk {
+                    Some(id) => {
+                        if !multi {
+                            sel.clear();
+                            sel.insert(id);
+                        } else if !sel.remove(&id) {
+                            sel.insert(id);
+                        }
                     }
-                });
+                    None if !multi => {
+                        sel.clear();
+                        ctx.memory_mut(|m| {
+                            if let Some(id) = m.focused() {
+                                m.surrender_focus(id);
+                            }
+                        });
+                    }
+                    None => {}
+                }
             }
         }
 
@@ -1866,11 +2618,7 @@ impl App {
             let er = eraser_r(&self.brush);
             let step = (self.brush.size * 0.4).clamp(1.5, 6.0);
             if bg.drag_started_by(PointerButton::Primary) {
-                self.hist.push(tab.strokes.clone());
-                if self.hist.len() > 60 {
-                    self.hist.remove(0);
-                }
-                self.redo.clear();
+                push_hist(&mut self.hist, &mut self.redo, tab);
                 if let Some(s) = ctx.input(|i| i.pointer.press_origin()).map(to_world) {
                     if self.brush.kind == Kind::Eraser {
                         self.last_e = Some(s);
@@ -1878,7 +2626,9 @@ impl App {
                     } else {
                         let mut pts = Vec::new();
                         add_pts(&mut pts, s, step);
+                        *next_id += 1;
                         self.cur_ink = Some(Ink {
+                            id: *next_id,
                             pts,
                             color: self.brush.color,
                             size: self.brush.size,
@@ -1967,7 +2717,7 @@ impl App {
         let dbl = tool == Tool::Select && bg.double_clicked();
         if dbl {
             spawn_at = bg.interact_pointer_pos();
-        } else if spawn_text.is_some() {
+        } else if spawn_text.is_some() || spawn_req {
             spawn_at = Some(
                 hover
                     .map(|h| h + vec2(130.0, 100.0))
@@ -1980,6 +2730,7 @@ impl App {
             let n = text.chars().count();
             *next_id += 1;
             let id = *next_id;
+            push_hist(&mut self.hist, &mut self.redo, tab);
             tab.notes.push(Note {
                 id,
                 x: w.x - 130.0,
@@ -2009,6 +2760,7 @@ impl App {
         }
         if !incoming.is_empty() {
             let at = to_world(hover.unwrap_or(rect.center()));
+            push_hist(&mut self.hist, &mut self.redo, tab);
             sel.clear();
             for (k, img) in incoming.into_iter().enumerate() {
                 let off = vec2(24.0, 24.0) * k as f32;
@@ -2038,7 +2790,19 @@ impl App {
         {
             let org = view.origin.to_vec2() + view.pan;
             for k in &tab.strokes {
-                paint_ink(&painter, k, org, view.z, rect);
+                if let Some(bb) = paint_ink(&painter, k, org, view.z, rect) {
+                    if sel.contains(&k.id) {
+                        painter.add(egui::Shape::closed_line(
+                            vec![
+                                bb.left_top(),
+                                bb.right_top(),
+                                bb.right_bottom(),
+                                bb.left_bottom(),
+                            ],
+                            Stroke::new(1.5_f32, ACC),
+                        ));
+                    }
+                }
             }
             if let Some(k) = &self.cur_ink {
                 paint_ink(&painter, k, org, view.z, rect);
@@ -2099,8 +2863,36 @@ impl App {
                 }
             }
         }
+        // a drag that starts on a stroke moves it; elsewhere it draws a selection box
+        let mut stroke_started = false;
+        if live && bg.drag_started_by(PointerButton::Primary) {
+            let press = ctx.input(|i| i.pointer.press_origin());
+            let hitk = press
+                .and_then(|sp| hit_stroke(&tab.strokes, to_world(sp), (8.0 / view.z).max(4.0)));
+            if let Some(id) = hitk {
+                if !sel.contains(&id) {
+                    if !multi {
+                        sel.clear();
+                    }
+                    sel.insert(id);
+                }
+                self.mv_strokes = true;
+                stroke_started = true;
+            } else {
+                self.marquee = bg.interact_pointer_pos();
+            }
+        }
+        if acts.iter().any(|(_, o)| o.started) || stroke_started {
+            push_hist(&mut self.hist, &mut self.redo, tab);
+        }
         // move the whole selection
-        let mv = acts.iter().fold(Vec2::ZERO, |a, (_, o)| a + o.drag);
+        let mut mv = acts.iter().fold(Vec2::ZERO, |a, (_, o)| a + o.drag);
+        if self.mv_strokes && bg.dragged_by(PointerButton::Primary) {
+            mv += bg.drag_delta() / view.z;
+        }
+        if bg.drag_stopped() {
+            self.mv_strokes = false;
+        }
         if mv != Vec2::ZERO {
             for n in tab.notes.iter_mut().filter(|n| sel.contains(&n.id)) {
                 n.x += mv.x;
@@ -2109,6 +2901,12 @@ impl App {
             for m in tab.images.iter_mut().filter(|m| sel.contains(&m.id)) {
                 m.x += mv.x;
                 m.y += mv.y;
+            }
+            for k in tab.strokes.iter_mut().filter(|k| sel.contains(&k.id)) {
+                for q in k.pts.iter_mut() {
+                    q[0] += mv.x;
+                    q[1] += mv.y;
+                }
             }
             // pins riding on a selected host move with it already
             for p in tab.pins.iter_mut().filter(|p| sel.contains(&p.id)) {
@@ -2127,7 +2925,24 @@ impl App {
         if acts.iter().any(|(_, o)| o.changed) {
             dirty = true;
         }
+        // save a note as .txt
+        for (id, o) in &acts {
+            if o.save {
+                if let Some(n) = tab.notes.iter().find(|n| n.id == *id) {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .set_file_name("note.txt")
+                        .add_filter("Text", &["txt"])
+                        .save_file()
+                    {
+                        let _ = fs::write(path, &n.text);
+                    }
+                }
+            }
+        }
         // tie / cut strings
+        if acts.iter().any(|(_, o)| (o.tie && tie_ok) || o.cut) {
+            push_hist(&mut self.hist, &mut self.redo, tab);
+        }
         for (id, o) in &acts {
             if o.tie && tie_ok {
                 tab.strings.push((sel_pins[0], sel_pins[1]));
@@ -2148,15 +2963,13 @@ impl App {
             del = sel.clone();
         }
         if !del.is_empty() {
+            push_hist(&mut self.hist, &mut self.redo, tab);
             delete_items(tab, &del);
             sel.retain(|id| !del.contains(id));
             dirty = true;
         }
 
         // marquee selection
-        if live && bg.drag_started_by(PointerButton::Primary) {
-            self.marquee = bg.interact_pointer_pos();
-        }
         if let (Some(s), Some(now)) = (self.marquee, ctx.pointer_latest_pos()) {
             let mr = Rect::from_two_pos(s, now);
             if bg.drag_stopped() {
@@ -2172,6 +2985,19 @@ impl App {
                 for m in &tab.images {
                     if rs(m.x, m.y, m.w, m.h).intersects(mr) {
                         hit.insert(m.id);
+                    }
+                }
+                for k in &tab.strokes {
+                    let (mut a, mut b, mut c, mut d) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
+                    for q in &k.pts {
+                        a = a.min(q[0]);
+                        b = b.min(q[1]);
+                        c = c.max(q[0]);
+                        d = d.max(q[1]);
+                    }
+                    let h = k.size / 2.0;
+                    if rs(a - h, b - h, c - a + k.size, d - b + k.size).intersects(mr) {
+                        hit.insert(k.id);
                     }
                 }
                 for p in &tab.pins {
@@ -2205,8 +3031,8 @@ impl App {
 
         if mini {
             let mr = Rect::from_min_size(
-                pos2(rect.max.x - 192.0, rect.max.y - 132.0),
-                vec2(180.0, 120.0),
+                pos2(rect.max.x - 180.0, rect.max.y - 168.0),
+                vec2(168.0, 112.0),
             );
             let vt = to_world(rect.min);
             let mut b = Rect::from_min_size(pos2(vt.x, vt.y), rect.size() / view.z);
@@ -2225,23 +3051,20 @@ impl App {
             let b = b.expand(40.0);
             let sc = (mr.width() / b.width()).min(mr.height() / b.height());
             let map = |w: Pos2| mr.center() + (w - b.center()) * sc;
-            let mp = ui.painter_at(mr);
-            mp.rect_filled(
-                mr,
-                4.0,
-                if dark {
-                    Color32::from_rgba_unmultiplied(40, 40, 48, 235)
-                } else {
-                    Color32::from_white_alpha(235)
-                },
+            ui.painter().rect_filled(
+                mr.translate(vec2(0.0, 1.0)).expand(1.0),
+                10.0,
+                Color32::from_black_alpha(40),
             );
+            ui.painter().rect_filled(mr, 10.0, th_pan(dark));
+            let mp = ui.painter_at(mr.shrink(1.0));
             for m in &tab.images {
                 let r = Rect::from_min_size(map(pos2(m.x, m.y)), vec2(m.w, m.h) * sc);
                 mp.rect_filled(r, 0.0, Color32::from_gray(190));
             }
             for n in &tab.notes {
                 let r = Rect::from_min_size(map(pos2(n.x, n.y)), vec2(n.w, n.h) * sc);
-                mp.rect_filled(r, 0.0, NOTE);
+                mp.rect_filled(r, 0.0, Color32::from_rgb(0xd1, 0xc2, 0x54));
             }
             for k in &tab.strokes {
                 let col = Color32::from_rgb(k.color[0], k.color[1], k.color[2]);
@@ -2256,6 +3079,7 @@ impl App {
                 }
             }
             let vr = Rect::from_min_max(map(vp.min), map(vp.max));
+            mp.rect_filled(vr, 0.0, th_acc(dark).gamma_multiply(0.14));
             mp.add(egui::Shape::closed_line(
                 vec![
                     vr.left_top(),
@@ -2264,15 +3088,6 @@ impl App {
                     vr.left_bottom(),
                 ],
                 Stroke::new(1.5_f32, ACC),
-            ));
-            mp.add(egui::Shape::closed_line(
-                vec![
-                    mr.left_top(),
-                    mr.right_top(),
-                    mr.right_bottom(),
-                    mr.left_bottom(),
-                ],
-                Stroke::new(1.0_f32, Color32::from_gray(170)),
             ));
             let mresp = ui.interact(mr, Id::new("mini"), Sense::click_and_drag());
             if mresp.clicked() || mresp.dragged() {
@@ -2316,8 +3131,8 @@ impl App {
             painter.text(
                 rect.center(),
                 Align2::CENTER_CENTER,
-                "Just start typing to add a note, or paste / drop an image",
-                FontId::proportional(15.0),
+                "Just start typing to add a note\nPaste or drop images anywhere\nCtrl + click or drag a box to select several\nSpace + drag (or the Move board button) moves the board",
+                FontId::proportional(14.0),
                 if dark {
                     Color32::from_white_alpha(110)
                 } else {
@@ -2325,6 +3140,18 @@ impl App {
                 },
             );
         }
+        let n_items = tab.notes.len() + tab.images.len() + tab.pins.len() + tab.strokes.len();
+        let mut st = format!("{} item{}", n_items, if n_items == 1 { "" } else { "s" });
+        if !sel.is_empty() {
+            st += &format!("   {} selected", sel.len());
+        }
+        painter.text(
+            pos2(rect.min.x + 16.0, rect.max.y - 16.0),
+            Align2::LEFT_BOTTOM,
+            st,
+            FontId::proportional(12.0),
+            th_fg(dark).gamma_multiply(0.8),
+        );
         self.selected = sel;
         if dirty {
             self.dirty = true;
@@ -2337,45 +3164,31 @@ impl eframe::App for App {
         self.search_ui(ctx);
         self.settings_ui(ctx);
         self.top_bar(ctx);
-        egui::TopBottomPanel::top("tools").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                for (t, l) in [
-                    (Tool::Select, "Select"),
-                    (Tool::Pin, "Pin"),
-                    (Tool::Hand, "Hand"),
-                    (Tool::Draw, "Draw"),
-                ] {
-                    ui.selectable_value(&mut self.tool, t, l);
-                }
-                ui.separator();
-                if ui.toggle_value(&mut self.data.cfg.mini, "Map").changed() {
-                    self.dirty = true;
-                }
-                ui.separator();
-                if self.tool == Tool::Draw {
-                    ui.weak("Right-click for brush menu · [ ] size · Ctrl+Z / Ctrl+Y undo · Esc exits");
-                } else {
-                    ui.weak("Ctrl+click or drag a box to multi-select · right-click a pin to tie strings");
-                }
-            });
-        });
+        self.dock(ctx);
         egui::CentralPanel::default()
             .frame(egui::Frame::default().fill(if self.tool == Tool::Draw {
                 Color32::WHITE
-            } else if self.data.cfg.dark {
-                Color32::from_rgb(0x1c, 0x1c, 0x22)
             } else {
-                BG
+                th_bg(self.data.cfg.dark)
             }))
             .show(ctx, |ui| self.board(ui));
         // save right away, except mid-drag (saved on release)
         if self.dirty && !ctx.input(|i| i.pointer.any_down()) {
-            self.save();
+            let wait = Duration::from_millis(250);
+            if self.last_save.elapsed() >= wait {
+                self.save();
+            } else {
+                ctx.request_repaint_after(wait);
+            }
         }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
         self.save();
+        let _ = self.tx.send(Job::Quit);
+        if let Some(h) = self.writer.take() {
+            let _ = h.join();
+        }
     }
 }
 
